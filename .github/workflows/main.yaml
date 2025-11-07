@@ -14,6 +14,7 @@ on:
         type: string
 permissions:
   contents: write
+  pull-requests: write
   actions: read
   id-token: write
   pages: write
@@ -47,6 +48,10 @@ jobs:
     secrets: inherit
     with:
       sha: ${{ inputs.sha || github.sha }}
+  auto-merge:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/auto-merge.yaml
+    secrets: inherit
   release:
     uses: ./.github/workflows/release.yaml
     secrets: inherit

@@ -1,14 +1,10 @@
-name: Dependabot auto-merge
-on: pull_request
-
-permissions:
-  contents: write
-  pull-requests: write
+name: Dependabot Auto-Merge
+on: workflow_call
 
 jobs:
   dependabot:
     runs-on: "ubuntu-24.04"
-    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'microsoft/SNRAware'
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     steps:
       - name: Dependabot metadata
         id: metadata
