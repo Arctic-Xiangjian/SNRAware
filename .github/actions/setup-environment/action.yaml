@@ -1,0 +1,78 @@
+name: "Setup Environment"
+description: |
+  Install tools and define common variables.
+outputs:
+  package-version:
+    description: "a generated version usable for publishing packages and containers"
+    value: ${{ steps.runner-context.outputs.package-version }}
+runs:
+  using: "composite"
+  steps:
+    - id: runner-context
+      name: runner-context
+      shell: bash
+      env:
+        COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+        # github.head_ref only exists in PR builds
+        # github.ref_name only exists in branch builds (main)
+        COMMIT_REF: "${{ github.head_ref || github.ref_name }}"
+        RUN_ID: "${{ github.run_id }}"
+        IS_PR_BUILD: "${{ github.event_name == 'pull_request' && '1' || '0' }}"
+        # we are calling tagged versions and main branch builds both "main" builds
+        IS_MAIN_BUILD: "${{ github.event_name == 'push' && '1' || '0' }}"
+        BASE_SHA: "${{ github.event.pull_request.base.sha || github.event.before }}"
+        HEAD_SHA: "${{ github.event.pull_request.head.sha || github.event.after }}"
+      run: |
+        # make sure people are able to use packages installed with `uv tool install`
+        export PATH="${HOME}/.local/bin:$PATH"
+        echo "${HOME}/.local/bin" >> $GITHUB_PATH
+        export PATH="${PWD}/bin:$PATH"
+        echo "${PWD}/bin" >> $GITHUB_PATH
+
+        TOML_VERSION=$(grep -m 1 version pyproject.toml | tr -s " " | tr -d '"' | tr -d "'" | cut -d" " -f3)
+        MAIN_BUILD_VERSION="$TOML_VERSION.pre$RUN_ID"
+        PR_BUILD_VERSION="$(date --date "$COMMIT_TIMESTAMP" "+$TOML_VERSION.pre$RUN_ID.dev%Y%m%d%H%M%S")"
+
+        echo "timestamp: $COMMIT_TIMESTAMP"
+        echo "commit ref: $COMMIT_REF"
+        echo "version found in toml: $TOML_VERSION"
+        echo "version calculated for main branch builds: $MAIN_BUILD_VERSION"
+        echo "version calculated for pr builds: $PR_BUILD_VERSION"
+        echo "runid: $RUN_ID"
+
+        if  [[ $COMMIT_REF == "v$TOML_VERSION" ]] ;
+        then
+          echo "detected tag build: $COMMIT_REF"
+          PACKAGE_VERSION=$TOML_VERSION
+        elif [[ $COMMIT_REF == "main" ]] ;
+        then
+          echo "detected main branch build"
+          echo "will generate a release candidate"
+          # if the package is installed with "allow-prereleases", the latest version of this branch is used
+          PACKAGE_VERSION=$MAIN_BUILD_VERSION
+        else
+          echo "detected branch build"
+          echo "will generate a dev version"
+          # these version numbers are only installable by specifying the full version string
+          PACKAGE_VERSION=$PR_BUILD_VERSION
+        fi
+
+        echo "generating context for version: $PACKAGE_VERSION"
+        echo "package-version=$PACKAGE_VERSION" >> $GITHUB_OUTPUT
+        echo "is-pr-build=$IS_PR_BUILD" >> $GITHUB_OUTPUT
+        echo "is-main-build=$IS_MAIN_BUILD" >> $GITHUB_OUTPUT
+        echo "base-sha=$BASE_SHA" >> $GITHUB_OUTPUT
+        echo "head-sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+    - name: "install-uv"
+      uses: astral-sh/setup-uv@v6
+      with:
+        version: "0.9"
+    - id: "update-docker-data-root"
+      name: "update-docker-data-root"
+      shell: bash
+      run: |
+        sudo systemctl stop docker docker.socket
+        sudo mkdir -p /mnt/docker-data
+        sudo chmod 711 /mnt/docker-data
+        echo '{ "data-root": "/mnt/docker-data" }' | sudo tee /etc/docker/daemon.json
+        sudo systemctl start docker

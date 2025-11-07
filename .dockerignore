@@ -1,0 +1,10 @@
+**/.venv
+**/.tmp
+**/.idea
+**/.vscode
+**/*.pyc
+
+*/src/python/*.egg-info
+*/dist/
+
+.git
