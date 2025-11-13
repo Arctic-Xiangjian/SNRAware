@@ -11,6 +11,10 @@ set shell := ['bash', '-ceuo', 'pipefail']
 @test:
     pytest
 
+@fix:
+    ruff check --fix
+    ruff format
+
 @build-package:
     uv build
 

@@ -1,0 +1,14 @@
+_target_: snraware.components.model.config.SOANetConfig
+
+defaults:
+  - /backbone/base_backbone@_here_
+  - block: block_params
+  
+name: "SOAnet"
+
+# number of attentin stages in the soanet backbone
+# optionally, tensor size can be reduced by x2 for every stage
+num_stages: 2
+
+# whether to downsample between stages
+downsample: True

@@ -33,6 +33,9 @@ bld/
 [Oo]ut/
 [Ll]og/
 [Ll]ogs/
+lightning_logs/
+run/
+.run/
 
 # Build results on 'Bin' directories
 **/[Bb]in/*

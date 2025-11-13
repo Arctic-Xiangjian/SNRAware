@@ -1,0 +1,5 @@
+# learning rate (used for params not sorted into pre/backbone/post)
+lr: 1e-4
+
+# Weight decay regularization
+weight_decay: 0.0

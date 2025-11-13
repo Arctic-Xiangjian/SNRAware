@@ -1,0 +1,29 @@
+_target_: snraware.projects.mri.denoising.data.MRIDenoisingDataset
+
+cutout_shape: [64, 64, 16]
+repetition: 1
+min_noise_level: 0.1
+max_noise_level: 128.0
+kspace_filter_sigma: [0.8, 1.0, 1.5, 2.0, 2.25]
+kspace_filter_sigma_T: [0.25, 0.5, 0.65, 0.85, 1.0, 1.5, 2.0, 2.25]
+prob_apply_filter_T: 0.2
+pf_filter_ratio: [1.0, 0.875, 0.75, 0.625]
+phase_resolution_ratio: [1.0, 0.75, 0.65, 0.55]
+readout_resolution_ratio: [1.0, 0.75, 0.65, 0.55]
+only_white_noise: false
+ignore_gmap: false
+add_noise: true
+add_salt_pepper: true
+salt_pepper_amount: 0.4
+salt_pepper_prob: 0.4
+add_poisson: true
+poisson_prob: 0.4
+shuffle_along_3rd_dim: true
+shuffle_along_3rd_dim_prob: 0.1
+matrix_size_adjust_ratio: [0.5, 0.75, 1.0, 1.25, 1.5]
+matrix_size_adjust_prob: 0.5
+resolution_reduction_prob: 0.0
+partial_fourier_prob: 0.0
+single_frame_mode: true
+single_frame_mode_prob: 0.1
+dicom_mode: false 

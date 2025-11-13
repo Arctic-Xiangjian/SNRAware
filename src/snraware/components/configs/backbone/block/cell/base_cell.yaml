@@ -1,0 +1,46 @@
+# conv or lin, type of attention in the spatial attention modules
+attention_type: conv
+
+# conv or lin, type of mixer in the spatial attention modules; only conv is possible for the temporal attention
+mixer_type: conv
+
+# size of window for spatial attention. This is the number of pixels in a window. Given image height and weight H and W, number of windows is H/windows_size[0] * W/windows_size[1]; for 3D usecase, window_size order is [H, W, D]
+window_size: [16, 16, 1]
+
+# size of patch for spatial attention. This is the number of pixels in a patch. An image is first split into windows. Every window is further split into patches.
+patch_size: [2, 2, 1]
+
+# method to adjust window_size between resolution levels, "keep_window_size", "keep_num_window", "mixed".
+# "keep_window_size" means number of pixels in a window is kept after down/upsample the image; "keep_num_window" means the number of windows is kept after down/upsample the image; "mixed" means interleave both methods.
+window_sizing_method: mixed
+
+# number of transformer heads
+n_head: 16
+
+# the scaling ratio to increase/decrease dimensions in the mixer of an attention layer
+scale_ratio_in_mixer: 4.0
+
+# whether to normalize Q and K before computing attention matrix
+normalize_Q_K: True
+# whether to use cosine attention for computing attention matrix
+cosine_att: True
+# whether to add relative position bias to the attention matrix
+att_with_relative_position_bias: True
+# dropout probability for attention matrix
+att_dropout_p: 0.0
+# dropout probability after applying the attention matrix; aka stochastic residual connections
+dropout_p: 0.1
+# whether to add output projection in attention layer
+att_with_output_proj: True
+
+# normalization mode
+norm_mode: instance2d # "layer", "batch2d", "instance2d", "batch3d", "instance3d"
+
+# nonlinear activation function, "elu", "relu", "leakyrelu", "prelu", "relu6", "selu", "celu", "gelu"
+activation_func: prelu
+
+# upsampling method in backbone, "NN", "linear", "bspline"
+upsample_method: linear
+
+# whether to do timing in the attention layer
+with_timer: False

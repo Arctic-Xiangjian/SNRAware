@@ -1,0 +1,8 @@
+# Configuration for the imaging fm model
+
+defaults:
+  - backbone: hrnet
+  - optim: sophia
+  - scheduler: OneCycleLR
+  - heads: base_heads
+  - _self_

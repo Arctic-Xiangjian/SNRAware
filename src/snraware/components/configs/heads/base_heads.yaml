@@ -1,0 +1,7 @@
+# parameters for model heads
+
+PoolLinear:
+  add_tanh: false
+
+PreConv2D:
+  conv_with_bias: true

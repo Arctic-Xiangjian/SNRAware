@@ -1,0 +1,33 @@
+defaults:
+  - /backbone/block/cell/base_cell@_here_
+
+temporal:
+  _target_: snraware.components.model.config.TemporalAttentionConfig
+  stride_qk: [1, 1, 1]
+    
+spatial_local:
+  _target_: snraware.components.model.config.SpatialLocalConfig
+
+spatial_global:
+  _target_: snraware.components.model.config.SpatialGlobalConfig
+  shuffle_in_window: False
+
+convoluation:
+  _target_: snraware.components.model.config.ConvolutionConfig
+  conv_type: "conv3d"
+
+spatial_local_3d:
+  _target_: snraware.components.model.config.SpatialLocal3DConfig
+
+spatial_global_3d:
+  _target_: snraware.components.model.config.SpatialGlobal3DConfig
+  shuffle_in_window: False
+
+spatial_vit:
+  _target_: snraware.components.model.config.SpatialViTConfig
+
+vit_3d:
+  _target_: snraware.components.model.config.ViT3DConfig
+
+swin_3d:
+  _target_: snraware.components.model.config.Swin3DConfig

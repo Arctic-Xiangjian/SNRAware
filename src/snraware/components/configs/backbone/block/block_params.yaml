@@ -1,0 +1,11 @@
+
+_target_: snraware.components.model.config.BlockConfig
+
+defaults:
+  - cell: cell_params
+
+# sequential or parallel cells
+cell_type: sequential
+  
+# whether to add dense connections between cells in a block
+block_dense_connection: False

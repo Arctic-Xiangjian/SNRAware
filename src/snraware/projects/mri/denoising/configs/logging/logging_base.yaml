@@ -1,0 +1,17 @@
+project: "ifm-mri-denoising"
+run_name: "denoising_training"
+
+output_dir: ${hydra:run.dir}/${logging.run_name}
+
+wandb_entity: "biomed-signal-processing"
+wandb_dir: ${logging.output_dir}/wandb
+use_wandb: false
+
+save_ckpt_every_n_epochs: 2
+
+save_batches_to_output_dir: false
+
+# if wandb is enabled, batches are logged to wandb as videos
+log_train_batches: 16
+log_val_batches: 16
+log_test_batches: 32

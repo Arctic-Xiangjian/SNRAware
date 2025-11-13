@@ -1,0 +1,5 @@
+  # number of channels in main body of backbone
+  num_of_channels: 32
+
+  # block string to define the attention layers in blocks; if multiple strings are given, each is for a resolution level
+  block_str: ["T1L1G1"]

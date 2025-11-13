@@ -1,0 +1,8 @@
+title: SNRAware
+nav:
+    - overview.md
+    - attention_layers.md
+    - block_and_cell.md
+    - backbone.md
+    - examples_and_tests.md
+    - mri_denoising.md

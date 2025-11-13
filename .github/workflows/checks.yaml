@@ -22,6 +22,7 @@ jobs:
           ref: ${{ inputs.sha }}
           fetch-depth: 0
           fetch-tags: true
+          lfs: true
       - uses: ./.github/actions/setup-environment
         id: runner-context
       - name: check

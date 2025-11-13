@@ -1,0 +1,11 @@
+
+_target_: snraware.components.model.config.HRNetConfig
+
+defaults:
+  - /backbone/base_backbone@_here_
+  - block: block_params
+
+name: "HRnet"
+
+# number of resolution levels; image size reduce by x2 for every level
+num_resolution_levels: 2

@@ -1,0 +1,103 @@
+"""Run the denoising model inference."""
+
+import torch
+from omegaconf import OmegaConf
+
+from snraware.projects.mri.denoising.lightning_denoising import LitDenoising
+from snraware.projects.mri.denoising.model import DenoisingModel
+
+__all__ = [
+    "load_lit_model",
+    "load_model",
+    "load_scripted_model",
+]
+
+# -------------------------------------------------------------------------------------------------
+
+
+def load_scripted_model(saved_model_path):
+    """
+    Load a saved torch scripted ".pts" model
+    @rets:
+        - model (torch scripted model): the model ready for inference.
+    """
+    model = None
+    try:
+        model = torch.jit.load(saved_model_path)
+    except Exception as e:
+        print(f"Error happened in load_scripted_model for {saved_model_path}: {e}")
+
+    return model
+
+
+# -------------------------------------------------------------------------------------------------
+
+
+def load_model(saved_model_path, saved_config_path):
+    """
+    Load a saved torch ".pth" model
+    @rets:
+        - model (torch model): the model ready for inference
+        - config (omegaconf): the config used to create the model.
+    """
+    model = None
+    config = None
+    try:
+        # load config
+        config = OmegaConf.load(saved_config_path)
+
+        # instantiate a model with this config
+        model = DenoisingModel(
+            config=config,
+            D=config.dataset.cutout_shape[2],
+            H=config.dataset.cutout_shape[0],
+            W=config.dataset.cutout_shape[1],
+        )
+
+        # load the model weights
+        status = torch.load(saved_model_path)
+        if "model_state_dict" in status:
+            model.load_state_dict(status["model_state_dict"])
+        else:
+            model.load_state_dict(status)
+    except Exception as e:
+        print(f"Error happened in load_model for {saved_model_path}, {saved_config_path}: {e}")
+
+    return model, config
+
+
+# -------------------------------------------------------------------------------------------------
+
+
+def load_lit_model(saved_model_path, saved_config_path):
+    """
+    Load a saved lightning model
+    @rets:
+        - model (torch model): the model ready for inference
+        - config (omegaconf): the config used to create the model.
+    """
+    lit_model = None
+    config = None
+    try:
+        # load config
+        config = OmegaConf.load(saved_config_path)
+
+        model = DenoisingModel(
+            config=config,
+            D=config.dataset.cutout_shape[2],
+            H=config.dataset.cutout_shape[0],
+            W=config.dataset.cutout_shape[1],
+        )
+
+        lit_model = LitDenoising.load_from_checkpoint(saved_model_path, model=model, config=config)
+    except Exception as e:
+        print(f"Error happened in load_lit_model for {saved_model_path}, {saved_config_path}: {e}")
+
+    return lit_model, config
+
+
+# ---------------------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    pass

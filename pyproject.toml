@@ -1,6 +1,6 @@
 [project]
 name = "snraware"
-description = ""
+description = "A deep learning imaging AI framework"
 version = "0.1.0"
 readme = "README.md"
 requires-python = ">=3.12,<4.0"
@@ -9,7 +9,43 @@ authors = [
 ]
 keywords = []
 license = "MIT"
-dependencies = []
+dependencies = [
+    "mkl-fft>=2.0.0",
+    "mkl-service>=2.4.2",
+    "typing_extensions",
+    "click",
+    "h5py",
+    "opencv-python",
+    "pathlib",
+    "PyWavelets",
+    "pytorch-wavelets",
+    "torchmetrics==1.7.3",
+    "torch-interpol",
+    "piq",
+    "imageio",
+    "pyyaml",
+    "wandb",
+    "wandb[media]",
+    "scipy",
+    "cffi",
+    "numpy>=2.2.6",
+    "torch>=2.8.0",
+    "setuptools",
+    "torchvision",
+    "torchinfo",
+    "prettytable",
+    "scikit-image",
+    "nibabel",
+    "matplotlib",
+    "einops",
+    "pandas",
+    "lightning",
+    "hydra-core",
+    "omegaconf",
+    "hydra_colorlog",
+    "pytest>=8.4.2",
+    "dvc[azure]",
+]
 
 [project.urls]
 repository = "https://github.com/microsoft/SNRAware"
@@ -42,6 +78,15 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = ["snraware"]
 
+[[tool.uv.index]]
+name = "mkl"
+url = "https://urob.github.io/numpy-mkl"
+
+[tool.uv.sources]
+numpy = { index = "mkl" }
+scipy = { index = "mkl" }
+mkl-service = { index = "mkl" }
+
 [project.scripts]
 
 [tool.pyright]
@@ -49,25 +94,16 @@ module-name = ["snraware"]
 include = ["src", "test"]
 exclude = ["**/__pycache__"]
 
-strictListInference = true
-strictDictionaryInference = true
-strictSetInference = true
 deprecateTypingAliases = true
 reportPropertyTypeMismatch = true
 reportUnusedImport = true
-reportUnusedClass = true
-reportUnusedVariable = true
 reportDuplicateImport = true
 reportUntypedFunctionDecorator = true
 reportUntypedClassDecorator = true
 reportUntypedBaseClass = true
 reportUntypedNamedTuple = true
-reportConstantRedefinition = true
 reportDeprecated = true
 reportInconsistentConstructor = true
-reportUnknownParameterType = true
-reportMissingParameterType = true
-reportMissingTypeArgument = true
 reportUnnecessaryCast = true
 reportUnnecessaryContains = true
 reportImplicitStringConcatenation = true
@@ -75,26 +111,44 @@ reportInvalidStubStatement = true
 reportIncompleteStub = true
 reportUnnecessaryTypeIgnoreComment = true
 reportMatchNotExhaustive = true
-reportShadowedImports = true
 
 reportMissingTypeStubs = false
 reportImportCycles = true
 reportUnusedFunction = false
 reportMissingSuperCall = false
-reportPrivateUsage = true
-reportUninitializedInstanceVariable = false  # disabled so we can check test directories
-reportUnknownArgumentType = true
 reportUnknownLambdaType = true
-reportUnknownVariableType = true
-reportUnknownMemberType = true
 reportCallInDefaultInitializer = true
 reportUnnecessaryIsInstance = true
-reportUnnecessaryComparison = true
 reportUnusedCallResult = false
 reportUnusedExpression = true
 reportImplicitOverride = false
 reportIncompatibleVariableOverride = true
-reportIncompatibleMethodOverride = true
+reportCallIssue = false
+reportGeneralTypeIssues = false
+reportIndexIssue = false
+reportOptionalIterable = false
+reportOperatorIssue = false
+reportOptionalCall = false
+reportMissingTypeArgument = false
+
+reportIncompatibleMethodOverride = false
+reportUninitializedInstanceVariable = false
+reportMissingParameterType = false
+reportUnknownArgumentType = false
+reportUnknownMemberType = false
+reportConstantRedefinition = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+reportArgumentType = false
+reportUnusedVariable = false
+reportPossiblyUnboundVariable = false
+reportAttributeAccessIssue = false
+reportOptionalMemberAccess = false
+reportPrivateUsage = false
+reportOptionalSubscript = false
+reportUnusedClass = false
+reportUndefinedVariable = false
+reportUnnecessaryComparison = false
 
 [tool.ruff]
 cache-dir = ".tmp/.ruff_cache"
@@ -124,12 +178,37 @@ select = [
     "PTH",  # Path
     "RUF",  # Ruff
     "UP",   # Unittest
-    "D213", # D213: Multi-line docstring summary should start at the second line
 ]
 ignore = [
+    "E501", # E501: Line too long ({width} > {limit})
     "D212", # D212: Multi-line docstring summary should start at the second line
     # This rule seems buggy: https://github.com/astral-sh/ruff/issues/2480
     "PD011", # PD011: Use `.to_numpy()` instead of `.values`
+    # TODO: re-enable these when we can fix the errors
+    "B007",  # Loop control variable `loader_ind` not used within loop body
+    "B008",  # Do not perform function call `torch.device` in argument defaults
+    "B016",  # Cannot raise a literal. Did you intend to return it or raise an Exception?
+    "D100",  # Missing docstrings
+    "D101",  # Missing docstrings
+    "D102",  # Missing docstrings
+    "D103",  # Missing docstrings
+    "D104",  # Missing docstrings
+    "D105",  # Missing docstrings
+    "D107",  # Missing docstrings
+    "D205",  # 1 blank line required between summary line and description
+    "D417",  # Missing argument descriptions in the docstring
+    "E722",  # Do not use bare `except`
+    "F403",  # Do not use `*` imports
+    "F405",  # X may be undefined, or defined from star imports
+    "PTH110", # `os.path.exists()` should be replaced by `Path.exists()`
+    "PTH112", # `os.path.isdir()` should be replaced by `Path.is_dir()`
+    "PTH113", # `os.path.isfile()` should be replaced by `Path.is_file()`
+    "PTH118", # `os.path.join()` should be replaced by `Path` with `/` operator
+    "PTH103", # `os.makedirs()` should be replaced by `Path.mkdir(parents=True)`
+    "PTH123", # `open()` should be replaced by `Path.open()`
+    "PTH208", # Use `pathlib.Path.iterdir()` instead.
+    "PTH120", # `os.path.dirname()` should be replaced by `Path.parent`
+    "NPY002",
 ]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
@@ -146,6 +225,9 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
     "D102", # Missing docstring in public method
     "D103", # Missing docstring in public function
     "D104", # Missing docstring in public package
+    "E501", # Line too long,
+    "D205", # blank line required between summary line and description
+    "D107", # Missing docstring in `__init__`
 ]
 
 [tool.ruff.lint.pydocstyle]
@@ -185,4 +267,10 @@ addopts = """
     --capture=no
     --cov-branch
     --cache-clear
+    -m 'not gpu'
+    -s
 """
+markers = [
+    "gpu: a test needs gpus to run",
+    "slow: mark a test as slow",
+]

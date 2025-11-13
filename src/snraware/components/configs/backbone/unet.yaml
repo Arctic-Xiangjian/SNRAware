@@ -1,0 +1,14 @@
+
+_target_: snraware.components.model.config.UNetConfig
+
+defaults:
+  - /backbone/base_backbone@_here_
+  - block: block_params
+
+name: "Unet"
+
+# number of resolution levels; image size reduce by x2 for every level
+num_resolution_levels: 2
+
+# whether to add unet channel attention on the skip connections between resolution levels
+use_unet_attention: True
