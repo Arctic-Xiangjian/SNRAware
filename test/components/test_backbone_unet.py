@@ -55,6 +55,8 @@ class TestUnet:
     def test(self, backbone):
         with_timer = True
         device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
 
         _B, C, T, H, W = 1, 2, 16, 32, 32
         test_in = torch.from_numpy(self.test_in).to(dtype=torch.float32, device=device)

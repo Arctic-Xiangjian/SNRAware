@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 from snraware.components.heads import PreConv2D, SimpleConv2d
 from snraware.components.model import HRnet, SOAnet, Unet
 from snraware.components.optim import OptimScheduler
+from snraware.components.setup import get_device
 
 # -----------------------------------------------------------------
 
@@ -216,6 +217,10 @@ class TestTrain:
         selected_markers = request.config.getoption("-m")
         if "gpu" not in selected_markers:
             pytest.skip("Skipping because marker 'gpu' is not set")
+
+        device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
 
         overrides = [
             f"backbone={backbone}",

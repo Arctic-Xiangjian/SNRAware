@@ -30,6 +30,10 @@ class TestSwin3DAttention:
 
     @pytest.mark.gpu
     def test(self):
+        device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
+
         t = np.arange(256)
         t = np.reshape(t, (16, 16))
 
@@ -70,8 +74,6 @@ class TestSwin3DAttention:
         stride_qks = [[1, 1, 1]]
 
         with_timer = True
-
-        device = get_device()
 
         B, T, C, H1, W1 = 1, 16, 2, 32, 32
         C_out = 32

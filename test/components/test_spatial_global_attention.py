@@ -29,7 +29,9 @@ class TestSpatialGlobalAttention:
 
     @pytest.mark.gpu
     def test(self):
-        print("Begin Testing")
+        device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
 
         t = np.arange(256)
         t = np.reshape(t, (16, 16))
@@ -102,7 +104,6 @@ class TestSpatialGlobalAttention:
         stride_qks = [[1, 1]]
 
         with_timer = True
-        device = get_device()
 
         B, C, T, H1, W1 = 1, 2, 16, 64, 64
         C_out = 4
@@ -144,7 +145,7 @@ class TestSpatialGlobalAttention:
 
                                 fname = f"{attention_type}_{normalize_Q_K}_{att_with_output_proj}_{cosine_att}_{att_with_relative_position_bias}_{stride_qk}"
                                 gt_fname = os.path.join(self.data_root, f"test_out_{fname}.npy")
-                                np.save(gt_fname, test_out.detach().cpu().numpy())
+                                # np.save(gt_fname, test_out.detach().cpu().numpy())
                                 assert os.path.exists(gt_fname)
                                 test_out_gt = np.load(
                                     os.path.join(self.data_root, f"test_out_{fname}.npy")

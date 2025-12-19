@@ -7,7 +7,7 @@ import pytest
 import torch
 from hydra import compose, initialize
 
-from snraware.components.setup import end_timer, start_timer
+from snraware.components.setup import end_timer, get_device, start_timer
 from snraware.projects.mri.denoising.inference_model import (
     load_lit_model,
     load_model,
@@ -126,6 +126,10 @@ class TestDenoising:
         if "gpu" not in selected_markers or "slow" not in selected_markers:
             pytest.skip("Skipping because both markers 'gpu' and 'slow' are not set")
 
+        device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
+
         with initialize(
             version_base=None, config_path="../src/snraware/projects/mri/denoising/configs"
         ):
@@ -166,6 +170,10 @@ class TestDenoising:
 
         if os.path.exists(self.data_root) is False or os.path.exists(self.test_root) is False:
             pytest.skip("Skipping because test data not found")
+
+        device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
 
         with initialize(
             version_base=None, config_path="../src/snraware/projects/mri/denoising/configs"

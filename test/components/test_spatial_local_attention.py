@@ -26,7 +26,9 @@ class TestSpatialLocalAttention:
 
     @pytest.mark.gpu
     def test(self):
-        print("Begin Testing")
+        device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
 
         t = np.arange(256)
         t = np.reshape(t, (16, 16))
@@ -102,7 +104,6 @@ class TestSpatialLocalAttention:
         stride_qks = [[1, 1], [2, 2]]
 
         with_timer = True
-        device = get_device()
 
         B, T, C, H1, W1 = 1, 4, 2, 64, 64
         C_out = 16

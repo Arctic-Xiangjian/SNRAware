@@ -3,15 +3,16 @@ name = "snraware"
 description = "A deep learning imaging AI framework"
 version = "0.1.0"
 readme = "README.md"
-requires-python = ">=3.12,<4.0"
+requires-python = ">=3.12,<=3.14"
 authors = [
     {name = "Hui Xue", email = "xueh@microsoft.com"},
 ]
 keywords = []
 license = "MIT"
 dependencies = [
-    "mkl-fft>=2.0.0",
-    "mkl-service>=2.4.2",
+    "mkl",
+    "mkl-fft",
+    "mkl-service",
     "typing_extensions",
     "click",
     "h5py",
@@ -77,15 +78,6 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = ["snraware"]
-
-[[tool.uv.index]]
-name = "mkl"
-url = "https://urob.github.io/numpy-mkl"
-
-[tool.uv.sources]
-numpy = { index = "mkl" }
-scipy = { index = "mkl" }
-mkl-service = { index = "mkl" }
 
 [project.scripts]
 

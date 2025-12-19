@@ -72,6 +72,9 @@ class TestBlock:
         test_in = torch.rand(B, T, C, H, W)
 
         device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
+
         test_in = test_in.to(device=device, dtype=torch.float32)
         test_in = torch.permute(test_in, [0, 2, 1, 3, 4])
 

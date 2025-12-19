@@ -39,6 +39,8 @@ class TestConvolutionModule:
 
         with_timer = True
         device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
 
         test_in = torch.rand(B, T, C, H, W, device=device)
         assert np.linalg.norm(self.test_in - test_in.cpu().numpy()) < 1e-3

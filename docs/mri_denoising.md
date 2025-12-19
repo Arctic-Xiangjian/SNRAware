@@ -45,14 +45,4 @@ User needs to log into the wandb as `wandb login`. Training and validation sampl
 
 # Run inference
 
-After training the model, user can run inference with `run_inference.py` in the `src/snraware/projects/mri/denoising` folder:
-
-```bash
-export model_file="SNRAware-small.pts"
-export config_file="SNRAware-small_config.yaml"
-export res_dir="res"
-export data_dir="/data"
-
-python3 ./src/snraware/projects/mri/denoising/run_inference.py --input_dir ${data_dir} --output_dir ${data_dir}/${res_dir} --saved_model_path $model_file --saved_config_path $config_file --batch_size 1 --input_fname input --gmap_fname gmap
-
-```
+After training the model, user can run inference with `run_inference.py` in the `src/snraware/projects/mri/denoising` folder. Examples to run the model inference is given in the [README](../README.md).

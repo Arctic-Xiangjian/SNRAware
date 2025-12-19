@@ -28,13 +28,14 @@ class TestTemporalAttention:
 
     @pytest.mark.gpu
     def test(self):
-        print("Begin Testing")
+        device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
 
         B, T, C, H, W = 2, 16, 3, 16, 16
         C_out = 32
 
         with_timer = True
-        device = get_device()
 
         test_in = torch.rand(B, T, C, H, W, device=device)
         assert np.linalg.norm(self.test_in - test_in.cpu().numpy()) < 1e-3

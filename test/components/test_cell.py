@@ -31,6 +31,9 @@ class TestCell:
         test_in = torch.rand(B, T, C, H, W).to(torch.float32)
 
         device = get_device()
+        if device != "cuda":
+            pytest.skip("GPU only test")
+
         test_in = test_in.to(device=device)
 
         att_types = [
