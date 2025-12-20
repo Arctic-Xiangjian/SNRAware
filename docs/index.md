@@ -1,6 +1,10 @@
 # SNRAware
 
-This repository contains the Pytorch code in our paper [SNRAware: Improved Deep Learning MRI Denoising with Signal-to-noise Ratio Unit Training and G-factor Map Augmentation](https://pubs.rsna.org/doi/full/10.1148/ryai.250227) published at the Radiology: Artificial Intelligence:
+This repository contains the Pytorch code two of our papers:
+
+[SNRAware: Improved Deep Learning MRI Denoising with Signal-to-noise Ratio Unit Training and G-factor Map Augmentation](https://pubs.rsna.org/doi/full/10.1148/ryai.250227) published at the Radiology: Artificial Intelligence
+
+[Imaging Transformer for MRI Denoising: a Scalable Model Architecture that enables Low SNR Imaging across Applications]().
 
 ```latex
 @article{
@@ -15,6 +19,19 @@ This repository contains the Pytorch code in our paper [SNRAware: Improved Deep 
     doi = {10.1148/ryai.250227},
     note ={PMID: 41123451},
     URL = {https://doi.org/10.1148/ryai.250227}
+}
+```
+
+[Imaging Transformer for MRI Denoising: a Scalable Model Architecture that enables Low SNR Imaging across Applications]:
+```latex
+@misc{xue2024imagingtransformermridenoising,
+      title={Imaging transformer for MRI denoising with the SNR unit training: enabling generalization across field-strengths, imaging contrasts, and anatomy}, 
+      author={Hui Xue and Sarah Hooper and Azaan Rehman and Iain Pierce and Thomas Treibel and Rhodri Davies and W Patricia Bandettini and Rajiv Ramasawmy and Ahsan Javed and Zheren Zhu and Yang Yang and James Moon and Adrienne Campbell and Peter Kellman},
+      year={2024},
+      eprint={2404.02382},
+      archivePrefix={arXiv},
+      primaryClass={eess.IV},
+      url={https://arxiv.org/abs/2404.02382}, 
 }
 ```
 
@@ -76,8 +93,13 @@ To test the model,
 ```bash
 # download the model from the huggingface
 # small model
-wget https://huggingface.co/microsoft/SNRAware/resolve/main/small/snraware_small_model.pts
-wget https://huggingface.co/microsoft/SNRAware/resolve/main/small/snraware_small_model.yaml
+wget --directory-prefix=./small/ https://huggingface.co/microsoft/SNRAware/resolve/main/small/snraware_small_model.pts
+wget --directory-prefix=./small/ https://huggingface.co/microsoft/SNRAware/resolve/main/small/snraware_small_model.yaml
+
+# or install the huggingface cli
+curl -LsSf https://hf.co/cli/install.sh | bash
+# download model
+hf download Microsoft/SNRAware --local-dir .
 
 # a test data is provided at ./test/data/inference
 # input data are [H, W, Frame] 3D complex tensor, input_real.npy and input_imag.npy store the 
@@ -85,8 +107,8 @@ wget https://huggingface.co/microsoft/SNRAware/resolve/main/small/snraware_small
 # gmap.npy is the g-factor map for all frames or for every frame, [H, W, 1 or Frame]
 
 # let's use the small model to run a inference
-export model_file=snraware_small_model.pts
-export config_file=snraware_small_model.yaml
+export model_file=./small/snraware_small_model.pts
+export config_file=./small/snraware_small_model.yaml
 
 # run the inference
 uv run python3 ./src/snraware/projects/mri/denoising/run_inference.py --input_dir ./test/data/phantom --output_dir /tmp/phantom_res_inference --saved_model_path $model_file --saved_config_path $config_file --batch_size 1 --input_fname input --gmap_fname gmap
