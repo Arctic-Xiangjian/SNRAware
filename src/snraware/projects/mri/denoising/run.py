@@ -18,6 +18,11 @@ from snraware.projects.mri.denoising.lightning_denoising import (
     LitDenoising,
     after_training,
 )
+from snraware.projects.mri.denoising.lora_utils import (
+    apply_lora_to_model,
+    count_trainable_parameters,
+    is_lora_enabled,
+)
 from snraware.projects.mri.denoising.model import DenoisingModel
 
 
@@ -146,6 +151,18 @@ def run_training(config: DictConfig):
         H=config.dataset.cutout_shape[0],
         W=config.dataset.cutout_shape[1],
     )
+
+    if is_lora_enabled(model_config=config):
+        model = apply_lora_to_model(model=model)
+        if trainer.global_rank == 0:
+            trainable, total = count_trainable_parameters(model)
+            pct = 100.0 * trainable / max(total, 1)
+            print(
+                f"{Fore.YELLOW}LoRA enabled: trainable parameters "
+                f"{trainable / 1e6:.3f}M / {total / 1e6:.3f}M ({pct:.3f}%)"
+                f"{Style.RESET_ALL}",
+                flush=True,
+            )
 
     # set up lightning components
     lit_model = LitDenoising(model=model, config=config)

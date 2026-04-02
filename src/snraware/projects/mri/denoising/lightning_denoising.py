@@ -15,6 +15,7 @@ from snraware.components.optim import OptimScheduler
 from snraware.projects.loss.imaging_loss import PSNR, Combined_Loss
 from snraware.projects.mri.denoising.data import MRIDenoisingDatasetTest
 from snraware.projects.mri.denoising.inference import running_inference
+from snraware.projects.mri.denoising.lora_utils import is_lora_enabled, save_lora_checkpoint
 
 # -----------------------------------------------------------------
 
@@ -558,7 +559,10 @@ def after_training(model, config):
     model_fname = os.path.join(
         config.logging.output_dir, f"model_{config.logging.project}_{config.logging.run_name}.pth"
     )
-    torch.save(model.state_dict(), model_fname)
+    if is_lora_enabled(model_config=config):
+        save_lora_checkpoint(model=model, checkpoint_path=model_fname, lora_config=config.lora)
+    else:
+        torch.save(model.state_dict(), model_fname)
 
     config_yaml = OmegaConf.to_yaml(config, resolve=True)
     config_fname = os.path.join(

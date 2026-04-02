@@ -4,6 +4,11 @@ import torch
 from omegaconf import OmegaConf
 
 from snraware.projects.mri.denoising.lightning_denoising import LitDenoising
+from snraware.projects.mri.denoising.lora_utils import (
+    apply_lora_to_model,
+    is_lora_checkpoint,
+    load_lora_checkpoint,
+)
 from snraware.projects.mri.denoising.model import DenoisingModel
 
 __all__ = [
@@ -55,8 +60,11 @@ def load_model(saved_model_path, saved_config_path):
         )
 
         # load the model weights
-        status = torch.load(saved_model_path)
-        if "model_state_dict" in status:
+        status = torch.load(saved_model_path, map_location="cpu")
+        if is_lora_checkpoint(status):
+            # Adapter checkpoints require compatible frozen backbone weights in `model`.
+            load_lora_checkpoint(model=model, checkpoint=status)
+        elif "model_state_dict" in status:
             model.load_state_dict(status["model_state_dict"])
         else:
             model.load_state_dict(status)
@@ -88,6 +96,9 @@ def load_lit_model(saved_model_path, saved_config_path):
             H=config.dataset.cutout_shape[0],
             W=config.dataset.cutout_shape[1],
         )
+
+        if config.get("lora") and bool(config.lora.get("enabled", False)):
+            model = apply_lora_to_model(model=model)
 
         lit_model = LitDenoising.load_from_checkpoint(saved_model_path, model=model, config=config)
     except Exception as e:

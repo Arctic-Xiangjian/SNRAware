@@ -59,3 +59,16 @@ val_data_portion: 0.04
 overlap_for_inference: [16, 16, 8]
 
 device_mesh: [2, 2]
+
+lora:
+  enabled: false
+  r: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+  target_modules:
+    - "\\.attn\\.key$"
+    - "\\.attn\\.query$"
+    - "\\.attn\\.value$"
+    - "\\.attn\\.output_proj$"
+    - "\\.mlp\\.0$"
+    - "\\.mlp\\.2$"
