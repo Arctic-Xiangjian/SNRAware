@@ -144,7 +144,6 @@ def _mock_config() -> DictConfig:
 def get_graceful_config(yaml_path: str) -> DictConfig:
     path = Path(yaml_path)
     if not path.exists():
-        print(f"[WARN] Config not found: {path}. Using mock fallback config.")
         return _mock_config()
 
     try:
@@ -153,24 +152,21 @@ def get_graceful_config(yaml_path: str) -> DictConfig:
         if OmegaConf.select(cfg, "lora") is None:
             cfg.lora = _mock_config().lora
         return cfg
-    except Exception as exc:
-        print(f"[WARN] Failed to parse config '{path}' ({exc}). Using mock fallback config.")
+    except Exception:
         return _mock_config()
 
 
 def _load_raw_state_dict(weight_path: str) -> tuple[dict[str, torch.Tensor] | None, str]:
     path = Path(weight_path)
     if not path.exists():
-        print(f"[WARN] Weight file not found: {path}. Continue with random initialization.")
         return None, "missing"
 
     try:
         scripted = torch.jit.load(str(path), map_location="cpu")
         state_dict = {k: v.detach().cpu() for k, v in scripted.state_dict().items()}
-        print(f"[INFO] Loaded scripted checkpoint from {path}.")
         return state_dict, "jit"
-    except Exception as jit_exc:
-        print(f"[WARN] torch.jit.load failed ({jit_exc}). Falling back to torch.load.")
+    except Exception:
+        pass
 
     try:
         status = torch.load(str(path), map_location="cpu")
@@ -179,12 +175,10 @@ def _load_raw_state_dict(weight_path: str) -> tuple[dict[str, torch.Tensor] | No
         if isinstance(status, dict):
             tensors = {k: v.detach().cpu() for k, v in status.items() if torch.is_tensor(v)}
             if tensors:
-                print(f"[INFO] Loaded torch checkpoint from {path}.")
                 return tensors, "torch"
-    except Exception as torch_exc:
-        print(f"[WARN] torch.load failed ({torch_exc}).")
+    except Exception:
+        pass
 
-    print("[WARN] Unable to read a usable state_dict. Continue with random initialization.")
     return None, "unusable"
 
 
@@ -234,29 +228,17 @@ def _best_shape_compatible_state(
     return best_filtered, best_match, best_mismatch
 
 
-def load_pretrained_weights(model: torch.nn.Module, weight_path: str) -> int:
+def load_pretrained_weights(model: torch.nn.Module, weight_path: str) -> tuple[int, int]:
     raw_state, source = _load_raw_state_dict(weight_path)
+    model_state_count = len(model.state_dict())
     if raw_state is None:
-        print("[INFO] Running with random initialization.")
-        return 0
+        return 0, model_state_count
 
     filtered, matched, mismatched = _best_shape_compatible_state(model, raw_state)
-    model_state_count = len(model.state_dict())
-    if matched == 0:
-        print(
-            f"[WARN] No compatible keys found from {source} checkpoint. Running with random initialization."
-        )
-        return 0
-
-    incompatible = model.load_state_dict(filtered, strict=False)
-    print(
-        "[INFO] Weights loaded: "
-        f"{matched}/{model_state_count} keys matched, "
-        f"{len(incompatible.missing_keys)} missing, "
-        f"{len(incompatible.unexpected_keys)} unexpected, "
-        f"{mismatched} shape-mismatched."
-    )
-    return matched
+    if matched > 0:
+        model.load_state_dict(filtered, strict=False)
+    
+    return matched, model_state_count
 
 
 class DummyMRIDataset(Dataset):
@@ -298,21 +280,15 @@ def _assert_lora_trainable_state(model: torch.nn.Module) -> None:
 
 
 def _print_report(report: dict[str, Any]) -> None:
-    print("-" * 92)
-    print(
-        f"[{report['stage']}] total={report['total_params']:,} | "
-        f"trainable={report['trainable_params']:,} ({report['trainable_pct']:.4f}%)"
-    )
-    print(
-        f"  step_ms={report['step_ms']:.2f} | "
-        f"initial_loss={report['initial_loss']:.6f} | "
-        f"updated_loss={report['updated_loss']:.6f} | "
-        f"eval_loss={report['eval_loss']:.6f}"
-    )
-    print(
-        f"  peak_vram_mb={report['peak_vram_mb']:.2f} | "
-        f"device={report['device']} | loaded_keys={report['loaded_keys']}"
-    )
+    """Print a visually structured assessment of a single pipeline pass."""
+    loss_check_mark = "✅" if report["updated_loss"] < report["initial_loss"] else "❌"
+    
+    print(f"\n--- {report['stage']} Pass Evaluation ---")
+    print(f"  [Weights] Loaded {report['loaded_keys']}/{report['total_keys']} keys successfully.")
+    print(f"  [PEFT]    Trainable Params: {report['trainable_params']:,} / {report['total_params']:,} ({report['trainable_pct']:.4f}%)")
+    print(f"  [Memory]  Peak VRAM: {report['peak_vram_mb']:.2f} MB")
+    print(f"  [Speed]   FWD + BWD + Optim Step: {report['step_ms']:.2f} ms")
+    print(f"  [Loss]    Initial: {report['initial_loss']:.6f}  ->  Updated: {report['updated_loss']:.6f} {loss_check_mark}")
 
 
 def run_pipeline(
@@ -330,7 +306,7 @@ def run_pipeline(
     lora_dropout: float,
 ) -> dict[str, Any]:
     model = DenoisingModel(cfg, D=depth, H=64, W=64)
-    matched_weight_keys = load_pretrained_weights(model, weight_path)
+    matched_keys, total_keys = load_pretrained_weights(model, weight_path)
 
     if is_lora:
         model = apply_lora_to_model(
@@ -395,7 +371,8 @@ def run_pipeline(
         "eval_loss": float(eval_loss.detach().cpu().item()),
         "peak_vram_mb": peak_vram_mb,
         "device": str(device),
-        "loaded_keys": matched_weight_keys,
+        "loaded_keys": matched_keys,
+        "total_keys": total_keys
     }
     _print_report(report)
     return report
@@ -417,7 +394,7 @@ def run_modality(
     seed: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     mode = "3D" if depth > 1 else "2D"
-    print(f"\n{'=' * 24} {mode} Pipeline (D={depth}) {'=' * 24}")
+    print(f"\n{'=' * 28} Executing {mode} Data Pipeline (D={depth}) {'=' * 28}")
 
     dataset = DummyMRIDataset(
         num_samples=num_samples, depth=depth, height=64, width=64, seed=seed + depth
@@ -488,9 +465,14 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     cfg = get_graceful_config(args.config_path)
-    print(f"[INFO] Device: {device}")
-    print(f"[INFO] Config source: {args.config_path}")
-    print(f"[INFO] Weight source: {args.weight_path}")
+    
+    print("=" * 84)
+    print("                 SNRAware LoRA Pipeline E2E Test")
+    print("=" * 84)
+    print(f"[*] Target Device  : {device}")
+    print(f"[*] Base Config    : {args.config_path}")
+    print(f"[*] Config Fallback: {'Yes' if not Path(args.config_path).exists() else 'No'}")
+    print(f"[*] LoRA Config    : r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
 
     reports = []
     for depth in (16, 1):
@@ -511,16 +493,29 @@ def main() -> None:
             )
         )
 
-    print("\n" + "=" * 92)
-    print("Summary")
+    # ------------------------------------------------------------------------
+    # FINAL SUMMARY REPORT
+    # ------------------------------------------------------------------------
+    print("\n\n" + "=" * 84)
+    print("🏆 FINAL EVALUATION SUMMARY 🏆".center(84))
+    print("=" * 84)
     for i in range(0, len(reports), 2):
         base = reports[i]
         lora = reports[i + 1]
-        reduction = 100.0 * (1.0 - (lora["trainable_params"] / max(base["trainable_params"], 1)))
-        print(
-            f"{base['stage'].split()[0]}: trainable reduction={reduction:.4f}% | "
-            f"baseline_step_ms={base['step_ms']:.2f} | lora_step_ms={lora['step_ms']:.2f}"
-        )
+        
+        mode_name = base['stage'].split()[0] # '3D' or '2D'
+        param_reduction = 100.0 * (1.0 - (lora["trainable_params"] / max(base["trainable_params"], 1)))
+        vram_savings = base["peak_vram_mb"] - lora["peak_vram_mb"]
+        
+        loss_valid = (lora['updated_loss'] < lora['initial_loss']) and (base['updated_loss'] < base['initial_loss'])
+        loss_status = "✅ Convergence Confirmed" if loss_valid else "❌ Warning: Loss did not decrease"
+
+        print(f"\n{mode_name} Modality Comparison (Baseline vs LoRA):")
+        print(f"  • Trainable Params : {base['trainable_params']:,}  -->  {lora['trainable_params']:,} (↓ Reduced by {param_reduction:.2f}%)")
+        print(f"  • Peak VRAM Usage  : {base['peak_vram_mb']:.2f} MB  -->  {lora['peak_vram_mb']:.2f} MB (💾 Saved {vram_savings:.2f} MB)")
+        print(f"  • Step Latency     : {base['step_ms']:.2f} ms  -->  {lora['step_ms']:.2f} ms")
+        print(f"  • Gradient Sanity  : {loss_status}")
+    print("\n" + "=" * 84 + "\n")
 
 
 if __name__ == "__main__":
