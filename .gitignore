@@ -424,3 +424,7 @@ FodyWeavers.xsd
 .idea
 .python-version
 dist
+
+*.pts
+
+checkpoints/*
