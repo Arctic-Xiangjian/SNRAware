@@ -1,0 +1,36 @@
+name: snraware_env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.11,<3.13
+  - pip
+  # PyTorch & CUDA (adjust pytorch-cuda version based on your system)
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.1
+  # Core scientific & data tools
+  - numpy
+  - scipy
+  - scikit-image
+  - matplotlib
+  - pandas
+  - h5py
+  # Deep learning utilities & frameworks
+  - lightning>=2.0.0
+  - wandb
+  - torchmetrics
+  - einops
+  # Configuration & Utilities
+  - hydra-core
+  - omegaconf
+  - tqdm
+  - colorama
+  - pytest
+  # MLOps / Huggingface (if pulling their hosted model weights)
+  - huggingface_hub
+  - pip:
+    # Any highly specific or unlisted dependencies usually go here
+    - ismrmrd # Standard for MR raw data if needed by their data loaders
