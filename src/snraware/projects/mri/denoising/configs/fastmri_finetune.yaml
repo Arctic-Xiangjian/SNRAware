@@ -1,0 +1,65 @@
+defaults:
+  - config
+  - _self_
+
+dataset:
+  cutout_shape: [320, 320, 1]
+
+logging:
+  use_wandb: false
+
+lora:
+  enabled: true
+  r: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+  target_modules:
+    - "\\.attn\\.key$"
+    - "\\.attn\\.query$"
+    - "\\.attn\\.value$"
+    - "\\.attn\\.output_proj$"
+    - "\\.mlp\\.0$"
+    - "\\.mlp\\.2$"
+
+base_model:
+  config_path: "./checkpoints/snraware_large_model.yaml"
+  checkpoint_path: "./checkpoints/snraware_large_model.pts"
+
+fastmri_finetune:
+  train_root: null
+  val_root: null
+  test_root: null
+  challenge: "singlecoil"
+  sample_rate: null
+  volume_sample_rate: null
+  use_dataset_cache: false
+  dataset_cache_file: "dataset_cache.pkl"
+  scanner_models: null
+  acc_factor: 4
+  crop_size: [320, 320]
+  deterministic_mask_from_name: false
+  sample_seed: null
+  batch_size: 1
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: false
+  shuffle_train: true
+  mode: "unet_and_lora"
+  max_epochs: 20
+  warmup_epochs: 5
+  unet_lr: 1.0e-4
+  adapter_lr: 1.0e-5
+  weight_decay: 0.0
+  scheduler_t_max: 0
+  resume_from: null
+  save_root: "./checkpoints/fine_tune"
+  run_name: null
+  log_every_n_steps: 50
+  evaluate_every_n_epochs: 1
+  device: "auto"
+  gfactor_unet:
+    in_chans: 2
+    out_chans: 1
+    chans: 32
+    num_pool_layers: 4
+    drop_prob: 0.0

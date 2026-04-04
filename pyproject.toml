@@ -44,6 +44,7 @@ dependencies = [
     "hydra-core",
     "omegaconf",
     "hydra_colorlog",
+    "fastmri",
     "pytest>=8.4.2",
     "dvc[azure]",
 ]

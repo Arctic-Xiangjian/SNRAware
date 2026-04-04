@@ -3,6 +3,11 @@
 import torch
 from omegaconf import OmegaConf
 
+from snraware.projects.mri.denoising.fastmri_compat import (
+    build_fastmri_wrapped_model,
+    is_fastmri_finetune_checkpoint,
+    load_fastmri_finetune_checkpoint,
+)
 from snraware.projects.mri.denoising.lightning_denoising import LitDenoising
 from snraware.projects.mri.denoising.lora_utils import (
     apply_lora_to_model,
@@ -12,6 +17,7 @@ from snraware.projects.mri.denoising.lora_utils import (
 from snraware.projects.mri.denoising.model import DenoisingModel
 
 __all__ = [
+    "load_fastmri_finetune_model",
     "load_lit_model",
     "load_model",
     "load_scripted_model",
@@ -105,6 +111,56 @@ def load_lit_model(saved_model_path, saved_config_path):
         print(f"Error happened in load_lit_model for {saved_model_path}, {saved_config_path}: {e}")
 
     return lit_model, config
+
+
+# ---------------------------------------------------------------------------------------
+
+
+def load_fastmri_finetune_model(
+    saved_model_path,
+    base_model_path,
+    base_config_path,
+    crop_size=(320, 320),
+    lora_config=None,
+    gfactor_unet_kwargs=None,
+):
+    """
+    Load a FastMRI fine-tune checkpoint consisting of a base model plus g-factor head.
+
+    @rets:
+        - model (SNRAwareWithGFactor): the wrapped model ready for inference
+        - config (omegaconf): the base config used to create the model
+    """
+    model = None
+    config = None
+    try:
+        model, config, _load_info = build_fastmri_wrapped_model(
+            base_config_path=base_config_path,
+            base_checkpoint_path=base_model_path,
+            height=crop_size[0],
+            width=crop_size[1],
+            depth=1,
+            lora_config=lora_config,
+            gfactor_unet_kwargs=gfactor_unet_kwargs,
+        )
+
+        status = torch.load(saved_model_path, map_location="cpu")
+        if not is_fastmri_finetune_checkpoint(status):
+            raise ValueError("Provided checkpoint is not a FastMRI fine-tune checkpoint")
+
+        load_fastmri_finetune_checkpoint(
+            model=model,
+            checkpoint=status,
+            apply_lora_fn=apply_lora_to_model,
+            lora_config=lora_config,
+        )
+    except Exception as e:
+        print(
+            f"Error happened in load_fastmri_finetune_model for "
+            f"{saved_model_path}, {base_model_path}, {base_config_path}: {e}"
+        )
+
+    return model, config
 
 
 # ---------------------------------------------------------------------------------------
