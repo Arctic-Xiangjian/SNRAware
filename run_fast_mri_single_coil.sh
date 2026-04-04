@@ -50,8 +50,8 @@ Environment variables you can change:
   UNET_LR                Default: 1e-4
   ADAPTER_LR             Default: 1e-5
   WEIGHT_DECAY           Default: 0.0
-  SAMPLE_RATE            Default: 0.02
-  VOLUME_SAMPLE_RATE     Default: null
+  SAMPLE_RATE            Training-only sample rate. Default: 0.02
+  VOLUME_SAMPLE_RATE     Training-only volume sample rate. Default: null
   RUN_NAME               Default: empty -> auto-generated
   SAVE_ROOT              Default: ./checkpoints/fine_tune
   USE_WANDB              Default: false
@@ -159,7 +159,7 @@ echo "  MODE=${MODE}"
 echo "  ACC_FACTOR=${ACC_FACTOR}"
 echo "  MAX_EPOCHS=${MAX_EPOCHS}"
 echo "  WARMUP_EPOCHS=${WARMUP_EPOCHS}"
-echo "  SAMPLE_RATE=${SAMPLE_RATE}"
+echo "  TRAIN_SAMPLE_RATE=${SAMPLE_RATE}"
 echo "  SAVE_ROOT=${SAVE_ROOT}"
 
 CMD=(
@@ -185,8 +185,8 @@ CMD=(
   "fastmri_finetune.unet_lr=${UNET_LR}"
   "fastmri_finetune.adapter_lr=${ADAPTER_LR}"
   "fastmri_finetune.weight_decay=${WEIGHT_DECAY}"
-  "fastmri_finetune.sample_rate=${SAMPLE_RATE}"
-  "fastmri_finetune.volume_sample_rate=${VOLUME_SAMPLE_RATE}"
+  "fastmri_finetune.train_sample_rate=${SAMPLE_RATE}"
+  "fastmri_finetune.train_volume_sample_rate=${VOLUME_SAMPLE_RATE}"
   "fastmri_finetune.sample_seed=${SAMPLE_SEED}"
   "fastmri_finetune.deterministic_mask_from_name=${DETERMINISTIC_MASK}"
   "fastmri_finetune.evaluate_every_n_epochs=${EVALUATE_EVERY_N_EPOCHS}"

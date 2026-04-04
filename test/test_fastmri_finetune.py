@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
 import h5py
@@ -23,6 +25,7 @@ from snraware.projects.mri.denoising.lora_utils import apply_lora_to_model
 from snraware.projects.mri.denoising.model import DenoisingModel
 from snraware.projects.mri.denoising.trainer_fa import (
     FastMRIFineTuneTrainer,
+    build_fastmri_dataloaders,
     complex_output_to_magnitude,
     configure_model_for_finetune_mode,
 )
@@ -49,6 +52,7 @@ def _tiny_config(mode: str):
             ],
         )
 
+    OmegaConf.set_struct(cfg, False)
     cfg.fastmri_finetune = OmegaConf.create(
         {
             "mode": mode,
@@ -306,6 +310,57 @@ def test_fastmri_bridge_dataset_returns_expected_shapes_and_legacy_normalization
     center_from = 320 // 2 - nsamp_center // 2
     center_to = center_from + nsamp_center
     assert torch.all(metadata["mask"][:, center_from:center_to, :] == 1)
+
+
+def test_build_fastmri_dataloaders_applies_sample_rate_to_train_only(monkeypatch):
+    created = []
+
+    class FakeDataset(Dataset):
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index: int):
+            metadata = {
+                "name": "vol0_slice_0",
+                "volume_name": "vol0",
+                "slice_idx": 0,
+                "mean": torch.tensor(0.0, dtype=torch.float32),
+                "std": torch.tensor(1.0, dtype=torch.float32),
+                "mask": torch.ones(4, 4, 2, dtype=torch.float32),
+                "masked_kspace": torch.zeros(4, 4, 2, dtype=torch.float32),
+            }
+            noisy = torch.zeros(2, 4, 4, dtype=torch.float32)
+            clean = torch.zeros(1, 4, 4, dtype=torch.float32)
+            return noisy, clean, torch.tensor(0.0), metadata
+
+    fake_module = types.ModuleType("fastmri_data.work_with_snraware")
+    fake_module.FastMRISNRAwareDataset = FakeDataset
+    monkeypatch.setitem(sys.modules, "fastmri_data.work_with_snraware", fake_module)
+
+    with initialize(version_base=None, config_path="../src/snraware/projects/mri/denoising/configs"):
+        config = compose(config_name="fastmri_finetune")
+
+    config.fastmri_finetune.train_root = "/tmp/train"
+    config.fastmri_finetune.val_root = "/tmp/val"
+    config.fastmri_finetune.test_root = "/tmp/test"
+    config.fastmri_finetune.num_workers = 0
+    config.fastmri_finetune.sample_rate = 0.02
+    config.fastmri_finetune.volume_sample_rate = 0.5
+    config.fastmri_finetune.train_sample_rate = None
+    config.fastmri_finetune.train_volume_sample_rate = None
+
+    build_fastmri_dataloaders(config)
+
+    assert len(created) == 3
+    assert created[0]["sample_rate"] == 0.02
+    assert created[0]["volume_sample_rate"] == 0.5
+    assert created[1]["sample_rate"] is None
+    assert created[1]["volume_sample_rate"] is None
+    assert created[2]["sample_rate"] is None
+    assert created[2]["volume_sample_rate"] is None
 
 
 @pytest.mark.parametrize("mode", ["unet_only", "unet_and_lora"])

@@ -198,14 +198,32 @@ def build_fastmri_dataloaders(
 
     ft_cfg = config.fastmri_finetune
 
-    def _build_dataset(root: str | Path | None):
+    def _resolve_train_sampling() -> tuple[Any | None, Any | None]:
+        train_sample_rate = ft_cfg.get("train_sample_rate", None)
+        train_volume_sample_rate = ft_cfg.get("train_volume_sample_rate", None)
+
+        # Backward compatibility: legacy `sample_rate` / `volume_sample_rate`
+        # are interpreted as training-only knobs.
+        if train_sample_rate is None:
+            train_sample_rate = ft_cfg.sample_rate
+        if train_volume_sample_rate is None:
+            train_volume_sample_rate = ft_cfg.volume_sample_rate
+
+        return train_sample_rate, train_volume_sample_rate
+
+    def _build_dataset(
+        root: str | Path | None,
+        *,
+        sample_rate: Any | None,
+        volume_sample_rate: Any | None,
+    ):
         if root in (None, "", "null"):
             return None
         return FastMRISNRAwareDataset(
             root=root,
             challenge=ft_cfg.challenge,
-            sample_rate=ft_cfg.sample_rate,
-            volume_sample_rate=ft_cfg.volume_sample_rate,
+            sample_rate=sample_rate,
+            volume_sample_rate=volume_sample_rate,
             use_dataset_cache=ft_cfg.use_dataset_cache,
             dataset_cache_file=ft_cfg.dataset_cache_file,
             scanner_models=ft_cfg.scanner_models,
@@ -216,12 +234,18 @@ def build_fastmri_dataloaders(
             sample_seed=ft_cfg.sample_seed,
         )
 
-    train_dataset = _build_dataset(ft_cfg.train_root)
+    train_sample_rate, train_volume_sample_rate = _resolve_train_sampling()
+    train_dataset = _build_dataset(
+        ft_cfg.train_root,
+        sample_rate=train_sample_rate,
+        volume_sample_rate=train_volume_sample_rate,
+    )
     if train_dataset is None:
         raise ValueError("fastmri_finetune.train_root must be provided")
 
-    val_dataset = _build_dataset(ft_cfg.val_root)
-    test_dataset = _build_dataset(ft_cfg.test_root)
+    # Validation and test always use the full dataset by default.
+    val_dataset = _build_dataset(ft_cfg.val_root, sample_rate=None, volume_sample_rate=None)
+    test_dataset = _build_dataset(ft_cfg.test_root, sample_rate=None, volume_sample_rate=None)
 
     loader_kwargs = {
         "batch_size": int(ft_cfg.batch_size),

@@ -89,6 +89,8 @@ fastmri_finetune:
   challenge: "singlecoil"
   sample_rate: null
   volume_sample_rate: null
+  train_sample_rate: null
+  train_volume_sample_rate: null
   use_dataset_cache: false
   dataset_cache_file: "dataset_cache.pkl"
   scanner_models: null
