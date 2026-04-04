@@ -38,8 +38,9 @@ Environment variables you can change:
   VAL_ROOT               FastMRI single-coil val folder.
   TEST_ROOT              FastMRI single-coil test folder. Default: VAL_ROOT
 
-  BASE_MODEL_CONFIG      Default: ./checkpoints/snraware_large_model.yaml
-  BASE_MODEL_CHECKPOINT  Default: ./checkpoints/snraware_large_model.pts
+  MODEL_SIZE             Base-model preset: small|large. Default: small
+  BASE_MODEL_CONFIG      Explicit YAML override. Default: empty -> preset from MODEL_SIZE
+  BASE_MODEL_CHECKPOINT  Explicit .pts override. Default: empty -> preset from MODEL_SIZE
 
   MODE                   Default: warmup_then_both
   ACC_FACTOR             Default: 8
@@ -62,6 +63,7 @@ Environment variables you can change:
 
 Examples:
   CUDA_DEVICE=0 ./run_fast_mri_single_coil.sh
+  MODEL_SIZE=large ./run_fast_mri_single_coil.sh
   USE_BF16=false ./run_fast_mri_single_coil.sh
   SAMPLE_RATE=null MAX_EPOCHS=20 WARMUP_EPOCHS=5 ./run_fast_mri_single_coil.sh
   ./run_fast_mri_single_coil.sh 1 lora.r=16 fastmri_finetune.batch_size=2
@@ -90,8 +92,9 @@ TRAIN_ROOT="${TRAIN_ROOT:-./data/fastmri/singlecoil_train}"
 VAL_ROOT="${VAL_ROOT:-./data/fastmri/singlecoil_val}"
 TEST_ROOT="${TEST_ROOT:-${VAL_ROOT}}"
 
-BASE_MODEL_CONFIG="${BASE_MODEL_CONFIG:-./checkpoints/snraware_large_model.yaml}"
-BASE_MODEL_CHECKPOINT="${BASE_MODEL_CHECKPOINT:-./checkpoints/snraware_large_model.pts}"
+MODEL_SIZE="${MODEL_SIZE:-small}"
+BASE_MODEL_CONFIG="${BASE_MODEL_CONFIG:-}"
+BASE_MODEL_CHECKPOINT="${BASE_MODEL_CHECKPOINT:-}"
 
 MODE="${MODE:-warmup_then_both}"
 ACC_FACTOR="${ACC_FACTOR:-8}"
@@ -119,6 +122,37 @@ LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-20}"
 SCHEDULER_T_MAX="${SCHEDULER_T_MAX:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 
+case "${MODEL_SIZE}" in
+  small|large) ;;
+  *)
+    echo "Unsupported MODEL_SIZE: ${MODEL_SIZE}" >&2
+    echo "Expected MODEL_SIZE to be one of: small, large" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -n "${BASE_MODEL_CONFIG}" || -n "${BASE_MODEL_CHECKPOINT}" ]]; then
+  if [[ -z "${BASE_MODEL_CONFIG}" || -z "${BASE_MODEL_CHECKPOINT}" ]]; then
+    echo "BASE_MODEL_CONFIG and BASE_MODEL_CHECKPOINT must either both be set or both be unset." >&2
+    exit 1
+  fi
+  RESOLVED_BASE_MODEL_CONFIG="${BASE_MODEL_CONFIG}"
+  RESOLVED_BASE_MODEL_CHECKPOINT="${BASE_MODEL_CHECKPOINT}"
+  USE_BASE_MODEL_PRESET=false
+else
+  case "${MODEL_SIZE}" in
+    small)
+      RESOLVED_BASE_MODEL_CONFIG="./checkpoints/small/snraware_small_model.yaml"
+      RESOLVED_BASE_MODEL_CHECKPOINT="./checkpoints/small/snraware_small_model.pts"
+      ;;
+    large)
+      RESOLVED_BASE_MODEL_CONFIG="./checkpoints/large/snraware_large_model.yaml"
+      RESOLVED_BASE_MODEL_CHECKPOINT="./checkpoints/large/snraware_large_model.pts"
+      ;;
+  esac
+  USE_BASE_MODEL_PRESET=true
+fi
+
 if [[ ! -d "${TRAIN_ROOT}" ]]; then
   echo "TRAIN_ROOT does not exist: ${TRAIN_ROOT}" >&2
   echo "Set TRAIN_ROOT=/path/to/singlecoil_train and retry." >&2
@@ -137,13 +171,13 @@ if [[ ! -d "${TEST_ROOT}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${BASE_MODEL_CONFIG}" ]]; then
-  echo "Base model config not found: ${BASE_MODEL_CONFIG}" >&2
+if [[ ! -f "${RESOLVED_BASE_MODEL_CONFIG}" ]]; then
+  echo "Base model config not found: ${RESOLVED_BASE_MODEL_CONFIG}" >&2
   exit 1
 fi
 
-if [[ ! -f "${BASE_MODEL_CHECKPOINT}" ]]; then
-  echo "Base model checkpoint not found: ${BASE_MODEL_CHECKPOINT}" >&2
+if [[ ! -f "${RESOLVED_BASE_MODEL_CHECKPOINT}" ]]; then
+  echo "Base model checkpoint not found: ${RESOLVED_BASE_MODEL_CHECKPOINT}" >&2
   exit 1
 fi
 
@@ -155,9 +189,12 @@ echo "Running FastMRI single-coil fine-tune with:"
 echo "  UV_BIN=${UV_BIN}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  DEVICE=${DEVICE}"
+echo "  MODEL_SIZE=${MODEL_SIZE}"
 echo "  TRAIN_ROOT=${TRAIN_ROOT}"
 echo "  VAL_ROOT=${VAL_ROOT}"
 echo "  TEST_ROOT=${TEST_ROOT}"
+echo "  BASE_MODEL_CONFIG=${RESOLVED_BASE_MODEL_CONFIG}"
+echo "  BASE_MODEL_CHECKPOINT=${RESOLVED_BASE_MODEL_CHECKPOINT}"
 echo "  MODE=${MODE}"
 echo "  ACC_FACTOR=${ACC_FACTOR}"
 echo "  MAX_EPOCHS=${MAX_EPOCHS}"
@@ -168,8 +205,6 @@ echo "  SAVE_ROOT=${SAVE_ROOT}"
 
 CMD=(
   "${UV_BIN}" run python -m snraware.projects.mri.denoising.train
-  "base_model.config_path=${BASE_MODEL_CONFIG}"
-  "base_model.checkpoint_path=${BASE_MODEL_CHECKPOINT}"
   "logging.use_wandb=${USE_WANDB}"
   "logging.project=${PROJECT}"
   "lora.enabled=true"
@@ -200,6 +235,13 @@ CMD=(
   "fastmri_finetune.device=${DEVICE}"
   "fastmri_finetune.use_bf16=${USE_BF16}"
 )
+
+if [[ "${USE_BASE_MODEL_PRESET}" == true ]]; then
+  CMD+=("base_model.variant=${MODEL_SIZE}")
+else
+  CMD+=("base_model.config_path=${RESOLVED_BASE_MODEL_CONFIG}")
+  CMD+=("base_model.checkpoint_path=${RESOLVED_BASE_MODEL_CHECKPOINT}")
+fi
 
 if [[ -n "${RUN_NAME}" ]]; then
   CMD+=("fastmri_finetune.run_name=${RUN_NAME}")

@@ -79,8 +79,9 @@ lora:
     - "\\.mlp\\.2$"
 
 base_model:
-  config_path: "./checkpoints/snraware_large_model.yaml"
-  checkpoint_path: "./checkpoints/snraware_large_model.pts"
+  variant: "small"
+  config_path: null
+  checkpoint_path: null
 
 fastmri_finetune:
   train_root: null

@@ -17,11 +17,11 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
+from snraware.projects.mri.denoising.base_model_resolver import resolve_base_model_paths
 from snraware.projects.mri.denoising.lora_utils import apply_lora_to_model
 from snraware.projects.mri.denoising.model import DenoisingModel
 
-DEFAULT_CONFIG_PATH = "/working2/arctic/snrawre/SNRAware/checkpoints/snraware_large_model.yaml"
-DEFAULT_WEIGHT_PATH = "/working2/arctic/snrawre/SNRAware/checkpoints/snraware_large_model.pts"
+DEFAULT_MODEL_SIZE = "small"
 
 TARGET_REPLACEMENTS = {
     "ifm.model.config.": "snraware.components.model.config.",
@@ -444,8 +444,9 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="E2E LoRA pipeline verification")
     parser.add_argument("--device", type=str, default=default_device)
-    parser.add_argument("--config_path", type=str, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--weight_path", type=str, default=DEFAULT_WEIGHT_PATH)
+    parser.add_argument("--model_size", type=str, choices=("small", "large"), default=DEFAULT_MODEL_SIZE)
+    parser.add_argument("--config_path", type=str, default=None)
+    parser.add_argument("--weight_path", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -464,14 +465,22 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    cfg = get_graceful_config(args.config_path)
+    resolved_config_path, resolved_weight_path = resolve_base_model_paths(
+        variant=args.model_size,
+        config_path=args.config_path,
+        checkpoint_path=args.weight_path,
+        repo_root=Path(__file__).resolve().parent,
+    )
+    cfg = get_graceful_config(resolved_config_path)
     
     print("=" * 84)
     print("                 SNRAware LoRA Pipeline E2E Test")
     print("=" * 84)
     print(f"[*] Target Device  : {device}")
-    print(f"[*] Base Config    : {args.config_path}")
-    print(f"[*] Config Fallback: {'Yes' if not Path(args.config_path).exists() else 'No'}")
+    print(f"[*] Model Preset   : {args.model_size}")
+    print(f"[*] Base Config    : {resolved_config_path}")
+    print(f"[*] Base Weights   : {resolved_weight_path}")
+    print(f"[*] Config Fallback: {'Yes' if not Path(resolved_config_path).exists() else 'No'}")
     print(f"[*] LoRA Config    : r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
 
     reports = []
@@ -484,7 +493,7 @@ def main() -> None:
                 batch_size=args.batch_size,
                 num_samples=args.num_samples,
                 num_workers=args.num_workers,
-                weight_path=args.weight_path,
+                weight_path=resolved_weight_path,
                 lr=args.lr,
                 lora_r=args.lora_r,
                 lora_alpha=args.lora_alpha,

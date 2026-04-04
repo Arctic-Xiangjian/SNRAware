@@ -16,6 +16,10 @@ pytest.importorskip("hydra")
 from hydra import compose, initialize
 
 from fastmri_data.work_with_snraware import FastMRISNRAwareDataset
+from snraware.projects.mri.denoising.base_model_resolver import (
+    DEFAULT_BASE_MODEL_VARIANT,
+    resolve_base_model_paths,
+)
 from snraware.projects.mri.denoising.fastmri_compat import (
     SNRAwareWithGFactor,
     is_fastmri_finetune_checkpoint,
@@ -523,12 +527,126 @@ def test_build_fastmri_dataloaders_applies_sample_rate_to_train_only(monkeypatch
     assert created[2]["volume_sample_rate"] is None
 
 
+@pytest.mark.parametrize(
+    ("variant", "config_suffix", "checkpoint_suffix"),
+    [
+        ("small", "checkpoints/small/snraware_small_model.yaml", "checkpoints/small/snraware_small_model.pts"),
+        ("large", "checkpoints/large/snraware_large_model.yaml", "checkpoints/large/snraware_large_model.pts"),
+    ],
+)
+def test_resolve_base_model_paths_for_presets(
+    variant: str,
+    config_suffix: str,
+    checkpoint_suffix: str,
+):
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path, checkpoint_path = resolve_base_model_paths(
+        variant=variant,
+        config_path=None,
+        checkpoint_path=None,
+        repo_root=repo_root,
+    )
+
+    assert config_path.endswith(config_suffix)
+    assert checkpoint_path.endswith(checkpoint_suffix)
+    assert Path(config_path).is_file()
+    assert Path(checkpoint_path).is_file()
+
+
+def test_resolve_base_model_paths_rejects_invalid_variant():
+    with pytest.raises(ValueError, match="Unsupported base model variant"):
+        resolve_base_model_paths("medium", None, None, repo_root=Path(__file__).resolve().parents[1])
+
+
+def test_resolve_base_model_paths_rejects_partial_override():
+    with pytest.raises(ValueError, match="must either both be set or both be unset"):
+        resolve_base_model_paths(
+            DEFAULT_BASE_MODEL_VARIANT,
+            "./checkpoints/small/snraware_small_model.yaml",
+            None,
+            repo_root=Path(__file__).resolve().parents[1],
+        )
+
+
+def test_resolve_base_model_paths_uses_explicit_pair_override():
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path, checkpoint_path = resolve_base_model_paths(
+        variant="large",
+        config_path="./checkpoints/small/snraware_small_model.yaml",
+        checkpoint_path="./checkpoints/small/snraware_small_model.pts",
+        repo_root=repo_root,
+    )
+
+    assert config_path.endswith("checkpoints/small/snraware_small_model.yaml")
+    assert checkpoint_path.endswith("checkpoints/small/snraware_small_model.pts")
+
+
+def test_resolve_base_model_paths_fails_with_exact_missing_path(tmp_path: Path):
+    with pytest.raises(FileNotFoundError, match="Base model config not found"):
+        resolve_base_model_paths("small", None, None, repo_root=tmp_path)
+
+
+def test_fastmri_config_defaults_to_small_base_model():
+    with initialize(version_base=None, config_path="../src/snraware/projects/mri/denoising/configs"):
+        config = compose(config_name="fastmri_finetune")
+
+    assert config.base_model.variant == "small"
+    assert config.base_model.config_path is None
+    assert config.base_model.checkpoint_path is None
+
+
 def test_run_fastmri_launcher_exposes_use_bf16():
     script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
 
     assert 'USE_BF16="${USE_BF16:-true}"' in script
     assert '"fastmri_finetune.use_bf16=${USE_BF16}"' in script
     assert "USE_BF16=false ./run_fast_mri_single_coil.sh" in script
+
+
+def test_run_fastmri_launcher_supports_model_size_presets():
+    script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
+
+    assert 'MODEL_SIZE="${MODEL_SIZE:-small}"' in script
+    assert '"base_model.variant=${MODEL_SIZE}"' in script
+    assert 'RESOLVED_BASE_MODEL_CONFIG="./checkpoints/small/snraware_small_model.yaml"' in script
+    assert 'RESOLVED_BASE_MODEL_CONFIG="./checkpoints/large/snraware_large_model.yaml"' in script
+    assert "MODEL_SIZE=large ./run_fast_mri_single_coil.sh" in script
+
+
+def test_e2e_pipeline_defaults_to_small_model_preset(monkeypatch):
+    import test_e2e_lora_pipeline as e2e_module
+
+    monkeypatch.setattr(sys, "argv", ["test_e2e_lora_pipeline.py"])
+    args = e2e_module.parse_args()
+
+    assert args.model_size == "small"
+    assert args.config_path is None
+    assert args.weight_path is None
+
+    config_path, checkpoint_path = resolve_base_model_paths(
+        variant=args.model_size,
+        config_path=args.config_path,
+        checkpoint_path=args.weight_path,
+        repo_root=Path(__file__).resolve().parents[1],
+    )
+    assert config_path.endswith("checkpoints/small/snraware_small_model.yaml")
+    assert checkpoint_path.endswith("checkpoints/small/snraware_small_model.pts")
+
+
+def test_e2e_pipeline_allows_large_model_preset(monkeypatch):
+    import test_e2e_lora_pipeline as e2e_module
+
+    monkeypatch.setattr(sys, "argv", ["test_e2e_lora_pipeline.py", "--model_size", "large"])
+    args = e2e_module.parse_args()
+
+    config_path, checkpoint_path = resolve_base_model_paths(
+        variant=args.model_size,
+        config_path=args.config_path,
+        checkpoint_path=args.weight_path,
+        repo_root=Path(__file__).resolve().parents[1],
+    )
+    assert config_path.endswith("checkpoints/large/snraware_large_model.yaml")
+    assert checkpoint_path.endswith("checkpoints/large/snraware_large_model.pts")
 
 
 @pytest.mark.parametrize(

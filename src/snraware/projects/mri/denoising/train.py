@@ -10,6 +10,7 @@ import torch
 from colorama import Fore, Style
 from omegaconf import DictConfig, OmegaConf
 
+from snraware.projects.mri.denoising.base_model_resolver import resolve_base_model_paths
 from snraware.projects.mri.denoising.fastmri_compat import build_fastmri_wrapped_model
 from snraware.projects.mri.denoising.trainer_fa import (
     FastMRIFineTuneTrainer,
@@ -59,6 +60,14 @@ def run_fastmri_finetuning(config: DictConfig):
         config.seed = torch.randint(0, 2**32, (1,)).item()
     seed_everything(int(config.seed))
 
+    resolved_base_config_path, resolved_base_checkpoint_path = resolve_base_model_paths(
+        variant=config.base_model.get("variant"),
+        config_path=config.base_model.get("config_path"),
+        checkpoint_path=config.base_model.get("checkpoint_path"),
+    )
+    config.base_model.config_path = resolved_base_config_path
+    config.base_model.checkpoint_path = resolved_base_checkpoint_path
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = config.fastmri_finetune.run_name or f"{config.fastmri_finetune.mode}_{timestamp}"
     run_dir = Path(config.fastmri_finetune.save_root) / run_name
@@ -71,6 +80,8 @@ def run_fastmri_finetuning(config: DictConfig):
     print(OmegaConf.to_yaml(config, resolve=True))
     print(f"{Fore.YELLOW}{'---' * 30}{Style.RESET_ALL}")
     print(f"Run directory: {run_dir}")
+    print(f"Resolved base config: {resolved_base_config_path}")
+    print(f"Resolved base checkpoint: {resolved_base_checkpoint_path}")
     print(f"{Fore.YELLOW}{'---' * 30}{Style.RESET_ALL}")
 
     wandb_run = None
@@ -126,6 +137,8 @@ def run_fastmri_finetuning(config: DictConfig):
         wandb_run.summary["base_weight_source"] = load_info["weight_source"]
         wandb_run.summary["base_matched_keys"] = load_info["matched_keys"]
         wandb_run.summary["base_mismatched_keys"] = load_info["mismatched_keys"]
+        wandb_run.summary["base_config_path"] = resolved_base_config_path
+        wandb_run.summary["base_checkpoint_path"] = resolved_base_checkpoint_path
         wandb_run.summary["training_precision"] = precision_state["mode"]
         wandb_run.summary["evaluation_precision"] = "fp32"
 
