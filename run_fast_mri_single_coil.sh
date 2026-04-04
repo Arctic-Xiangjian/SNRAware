@@ -56,11 +56,13 @@ Environment variables you can change:
   SAVE_ROOT              Default: ./checkpoints/fine_tune
   USE_WANDB              Default: false
   PROJECT                Default: fastmri-snraware
+  USE_BF16               Training autocast in bf16. Default: true
   SAMPLE_SEED            Default: 1234
   DETERMINISTIC_MASK     Default: true
 
 Examples:
   CUDA_DEVICE=0 ./run_fast_mri_single_coil.sh
+  USE_BF16=false ./run_fast_mri_single_coil.sh
   SAMPLE_RATE=null MAX_EPOCHS=20 WARMUP_EPOCHS=5 ./run_fast_mri_single_coil.sh
   ./run_fast_mri_single_coil.sh 1 lora.r=16 fastmri_finetune.batch_size=2
 EOF
@@ -106,6 +108,7 @@ RUN_NAME="${RUN_NAME:-}"
 SAVE_ROOT="${SAVE_ROOT:-./checkpoints/fine_tune}"
 USE_WANDB="${USE_WANDB:-false}"
 PROJECT="${PROJECT:-fastmri-snraware}"
+USE_BF16="${USE_BF16:-true}"
 SAMPLE_SEED="${SAMPLE_SEED:-1234}"
 DETERMINISTIC_MASK="${DETERMINISTIC_MASK:-true}"
 PIN_MEMORY="${PIN_MEMORY:-true}"
@@ -159,6 +162,7 @@ echo "  MODE=${MODE}"
 echo "  ACC_FACTOR=${ACC_FACTOR}"
 echo "  MAX_EPOCHS=${MAX_EPOCHS}"
 echo "  WARMUP_EPOCHS=${WARMUP_EPOCHS}"
+echo "  USE_BF16=${USE_BF16}"
 echo "  TRAIN_SAMPLE_RATE=${SAMPLE_RATE}"
 echo "  SAVE_ROOT=${SAVE_ROOT}"
 
@@ -194,6 +198,7 @@ CMD=(
   "fastmri_finetune.scheduler_t_max=${SCHEDULER_T_MAX}"
   "fastmri_finetune.save_root=${SAVE_ROOT}"
   "fastmri_finetune.device=${DEVICE}"
+  "fastmri_finetune.use_bf16=${USE_BF16}"
 )
 
 if [[ -n "${RUN_NAME}" ]]; then

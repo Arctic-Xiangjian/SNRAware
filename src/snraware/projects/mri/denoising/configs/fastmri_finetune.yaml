@@ -116,6 +116,7 @@ fastmri_finetune:
   log_every_n_steps: 50
   evaluate_every_n_epochs: 1
   device: "auto"
+  use_bf16: true
   gfactor_unet:
     in_chans: 2
     out_chans: 1

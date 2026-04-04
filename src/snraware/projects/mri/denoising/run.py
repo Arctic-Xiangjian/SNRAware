@@ -26,6 +26,15 @@ from snraware.projects.mri.denoising.lora_utils import (
 from snraware.projects.mri.denoising.model import DenoisingModel
 
 
+def _normalized_wandb_entity(entity: object) -> str | None:
+    if entity is None:
+        return None
+    text = str(entity).strip()
+    if text == "" or text.lower() == "null":
+        return None
+    return text
+
+
 def _measure_flops(Lit_model, config):
     dummy_input = torch.randn(
         1,
@@ -85,14 +94,17 @@ def run_training(config: DictConfig):
     # init wandb
     wandb_logger = None
     if config.logging.use_wandb:
-        wandb_logger = WandbLogger(
+        logger_kwargs = dict(
             project=config.logging.project,
             name=config.logging.run_name,
-            entity=config.logging.wandb_entity,
             save_dir=config.logging.wandb_dir,
             log_model=True,
             config=OmegaConf.to_container(config, resolve=True, throw_on_missing=False),
         )
+        wandb_entity = _normalized_wandb_entity(config.logging.get("wandb_entity"))
+        if wandb_entity is not None:
+            logger_kwargs["entity"] = wandb_entity
+        wandb_logger = WandbLogger(**logger_kwargs)
 
     # set up dataset
     data_module = DenoisingDataModule(config=config)

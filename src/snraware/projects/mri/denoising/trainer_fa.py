@@ -6,6 +6,7 @@ import random
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,9 @@ __all__ = [
     "complex_output_to_magnitude",
     "compute_volume_metrics",
     "configure_model_for_finetune_mode",
+    "fastmri_autocast_context",
     "group_slices_into_volumes",
+    "resolve_fastmri_precision",
     "seed_everything",
 ]
 
@@ -59,6 +62,34 @@ def complex_output_to_magnitude(output: torch.Tensor) -> torch.Tensor:
             f"FastMRI fine-tuning expects singleton T=1, got magnitude shape {tuple(magnitude.shape)}"
         )
     return magnitude.squeeze(2)
+
+
+def resolve_fastmri_precision(device: torch.device, *, use_bf16: bool) -> dict[str, Any]:
+    """Resolve the FastMRI fine-tuning precision policy for the selected device."""
+    if not use_bf16:
+        return {"mode": "fp32", "use_bf16": False}
+
+    if device.type != "cuda":
+        raise ValueError(
+            "fastmri_finetune.use_bf16=true requires a CUDA device, "
+            f"but got device={device}. Set fastmri_finetune.use_bf16=false "
+            "(or USE_BF16=false) to run in fp32."
+        )
+
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            f"Selected device {device} does not report bf16 support. "
+            "Set fastmri_finetune.use_bf16=false (or USE_BF16=false) to run in fp32."
+        )
+
+    return {"mode": "bf16", "use_bf16": True}
+
+
+def fastmri_autocast_context(device: torch.device, *, enabled: bool):
+    """Return the autocast context used by the FastMRI fine-tune path."""
+    if device.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=enabled)
 
 
 def _is_adapter_parameter(name: str) -> bool:
@@ -280,17 +311,24 @@ class FastMRIFineTuneTrainer:
         test_loader: DataLoader | None = None,
         metric_fns: dict[str, Callable[[np.ndarray, np.ndarray], float]] | None = None,
         wandb_run: Any | None = None,
+        precision_state: dict[str, Any] | None = None,
     ):
-        self.model = model.to(device=device, dtype=torch.float32)
         self.config = config
+        self.ft_cfg = config.fastmri_finetune
         self.device = device
+        self.precision_state = precision_state or resolve_fastmri_precision(
+            device,
+            use_bf16=bool(self.ft_cfg.use_bf16),
+        )
+        self.use_bf16 = bool(self.precision_state["use_bf16"])
+        self.precision_mode = str(self.precision_state["mode"])
+        self.model = model.to(device=device, dtype=torch.float32)
         self.run_dir = Path(run_dir)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
         self.metric_fns = metric_fns
         self.wandb_run = wandb_run
-        self.ft_cfg = config.fastmri_finetune
         self.loss_fn = nn.L1Loss()
         self.mode_state = configure_model_for_finetune_mode(
             self.model,
@@ -378,6 +416,9 @@ class FastMRIFineTuneTrainer:
         if self.wandb_run is not None:
             self.wandb_run.log(payload, step=step)
 
+    def _autocast_context(self, *, enabled: bool):
+        return fastmri_autocast_context(self.device, enabled=enabled)
+
     def _metadata_to_cpu_numpy(
         self,
         magnitude_prediction: torch.Tensor,
@@ -416,11 +457,13 @@ class FastMRIFineTuneTrainer:
             noisy = noisy.to(self.device, dtype=torch.float32, non_blocking=True)
             clean = clean.to(self.device, dtype=torch.float32, non_blocking=True)
 
-            output = self.model(noisy)
-            magnitude_output = complex_output_to_magnitude(output)
+            self.optimizer.zero_grad(set_to_none=True)
+            with self._autocast_context(enabled=self.use_bf16):
+                output = self.model(noisy)
+                magnitude_output = complex_output_to_magnitude(output)
+            magnitude_output = magnitude_output.float()
             loss = self.loss_fn(magnitude_output, clean)
 
-            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
 
@@ -461,8 +504,10 @@ class FastMRIFineTuneTrainer:
                 noisy = noisy.to(self.device, dtype=torch.float32, non_blocking=True)
                 clean = clean.to(self.device, dtype=torch.float32, non_blocking=True)
 
-                output = self.model(noisy)
-                magnitude_output = complex_output_to_magnitude(output)
+                with self._autocast_context(enabled=False):
+                    output = self.model(noisy)
+                    magnitude_output = complex_output_to_magnitude(output)
+                magnitude_output = magnitude_output.float()
                 loss = self.loss_fn(magnitude_output, clean)
 
                 loss_sum += float(loss.item())
@@ -509,6 +554,7 @@ class FastMRIFineTuneTrainer:
                 "model/trainable_parameters": trainable,
                 "model/total_parameters": total,
                 "model/trainable_ratio": trainable / max(total, 1),
+                "model/training_precision_bf16": float(self.use_bf16),
             }
         )
 

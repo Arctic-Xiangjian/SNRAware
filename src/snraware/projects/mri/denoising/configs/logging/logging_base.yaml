@@ -3,7 +3,7 @@ run_name: "denoising_training"
 
 output_dir: ${hydra:run.dir}/${logging.run_name}
 
-wandb_entity: "biomed-signal-processing"
+wandb_entity: null
 wandb_dir: ${logging.output_dir}/wandb
 use_wandb: false
 

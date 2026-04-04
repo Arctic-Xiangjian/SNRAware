@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import h5py
@@ -23,11 +24,14 @@ from snraware.projects.mri.denoising.fastmri_compat import (
 )
 from snraware.projects.mri.denoising.lora_utils import apply_lora_to_model
 from snraware.projects.mri.denoising.model import DenoisingModel
+import snraware.projects.mri.denoising.trainer_fa as trainer_fa_module
 from snraware.projects.mri.denoising.trainer_fa import (
     FastMRIFineTuneTrainer,
     build_fastmri_dataloaders,
     complex_output_to_magnitude,
     configure_model_for_finetune_mode,
+    fastmri_autocast_context,
+    resolve_fastmri_precision,
 )
 
 
@@ -44,7 +48,7 @@ def _tiny_config(mode: str):
                 "backbone.block.cell.n_head=4",
                 "backbone.block.cell.window_size=[4,4,1]",
                 "backbone.block.cell.patch_size=[2,2,1]",
-                "dataset.cutout_shape=[16,16,1]",
+                "dataset.cutout_shape=[32,32,1]",
                 "lora.enabled=True",
                 "lora.r=2",
                 "lora.lora_alpha=8.0",
@@ -65,6 +69,7 @@ def _tiny_config(mode: str):
             "max_epochs": 1,
             "log_every_n_steps": 100,
             "evaluate_every_n_epochs": 1,
+            "use_bf16": False,
         }
     )
     return cfg
@@ -91,9 +96,10 @@ class DummyGFactor(torch.nn.Module):
 
 
 class ToyFastMRIDataset(Dataset):
-    def __init__(self, num_samples: int, size: int = 16):
+    def __init__(self, num_samples: int, size: int = 32):
         super().__init__()
         generator = torch.Generator().manual_seed(42)
+        self.size = size
         self.noisy = torch.randn(num_samples, 2, size, size, generator=generator)
         self.clean = torch.sqrt(
             self.noisy[:, 0:1, ...].square() + self.noisy[:, 1:2, ...].square()
@@ -110,15 +116,15 @@ class ToyFastMRIDataset(Dataset):
             "slice_idx": index % 2,
             "mean": torch.tensor(0.0, dtype=torch.float32),
             "std": torch.tensor(1.0, dtype=torch.float32),
-            "mask": torch.ones(16, 16, 2, dtype=torch.float32),
-            "masked_kspace": torch.zeros(16, 16, 2, dtype=torch.float32),
+            "mask": torch.ones(self.size, self.size, 2, dtype=torch.float32),
+            "masked_kspace": torch.zeros(self.size, self.size, 2, dtype=torch.float32),
         }
         return self.noisy[index], self.clean[index], torch.tensor(0.0), metadata
 
 
 def _build_wrapped_model(mode: str) -> SNRAwareWithGFactor:
     config = _tiny_config(mode)
-    base_model = DenoisingModel(config=config, D=1, H=16, W=16)
+    base_model = DenoisingModel(config=config, D=1, H=32, W=32)
     return SNRAwareWithGFactor(base_model=base_model)
 
 
@@ -153,6 +159,18 @@ def _write_fake_fastmri_volume(path: Path) -> None:
 
 def _clean_lora_wrapped_name(name: str) -> str:
     return name.replace(".base_layer", "")
+
+
+class CaptureL1Loss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.pred_dtype = None
+        self.target_dtype = None
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        self.pred_dtype = pred.dtype
+        self.target_dtype = target.dtype
+        return torch.nn.functional.l1_loss(pred, target)
 
 
 def test_wrapper_routes_2ch_input_through_gfactor_head():
@@ -190,6 +208,51 @@ def test_complex_output_to_magnitude_uses_exact_formula_without_epsilon():
     magnitude = complex_output_to_magnitude(output)
     expected = torch.tensor([[[[5.0, 0.0]]]], dtype=torch.float32)
     assert torch.equal(magnitude, expected)
+
+
+def test_resolve_fastmri_precision_rejects_cpu_bf16():
+    with pytest.raises(ValueError, match="USE_BF16=false"):
+        resolve_fastmri_precision(torch.device("cpu"), use_bf16=True)
+
+
+def test_resolve_fastmri_precision_rejects_unsupported_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+
+    with pytest.raises(RuntimeError, match="USE_BF16=false"):
+        resolve_fastmri_precision(torch.device("cuda:0"), use_bf16=True)
+
+
+def test_resolve_fastmri_precision_allows_fp32_opt_out():
+    precision_state = resolve_fastmri_precision(torch.device("cpu"), use_bf16=False)
+    assert precision_state == {"mode": "fp32", "use_bf16": False}
+
+
+def test_fastmri_autocast_context_uses_cuda_bf16(monkeypatch):
+    calls = []
+
+    @contextmanager
+    def fake_autocast(*, device_type, dtype, enabled):
+        calls.append(
+            {
+                "device_type": device_type,
+                "dtype": dtype,
+                "enabled": enabled,
+            }
+        )
+        yield
+
+    monkeypatch.setattr(torch, "autocast", fake_autocast)
+
+    with fastmri_autocast_context(torch.device("cuda:0"), enabled=True):
+        pass
+
+    with fastmri_autocast_context(torch.device("cuda:0"), enabled=False):
+        pass
+
+    assert calls == [
+        {"device_type": "cuda", "dtype": torch.bfloat16, "enabled": True},
+        {"device_type": "cuda", "dtype": torch.bfloat16, "enabled": False},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -363,6 +426,14 @@ def test_build_fastmri_dataloaders_applies_sample_rate_to_train_only(monkeypatch
     assert created[2]["volume_sample_rate"] is None
 
 
+def test_run_fastmri_launcher_exposes_use_bf16():
+    script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
+
+    assert 'USE_BF16="${USE_BF16:-true}"' in script
+    assert '"fastmri_finetune.use_bf16=${USE_BF16}"' in script
+    assert "USE_BF16=false ./run_fast_mri_single_coil.sh" in script
+
+
 @pytest.mark.parametrize("mode", ["unet_only", "unet_and_lora"])
 def test_fastmri_trainer_smoke_step(mode: str, tmp_path: Path):
     config = _tiny_config(mode)
@@ -401,3 +472,105 @@ def test_fastmri_trainer_smoke_step(mode: str, tmp_path: Path):
     assert np.isfinite(train_metrics["loss"])
     assert set(val_metrics) == {"loss", "psnr", "ssim", "nmse"}
     assert all(np.isfinite(value) for value in val_metrics.values())
+
+
+def test_fastmri_trainer_train_uses_bf16_context_but_loss_stays_fp32(monkeypatch, tmp_path: Path):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.max_epochs = 1
+    config.fastmri_finetune.use_bf16 = True
+
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    model = _build_wrapped_model("unet_only")
+    trainer = FastMRIFineTuneTrainer(
+        model=model,
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "bf16_train",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+        precision_state={"mode": "bf16", "use_bf16": True},
+    )
+
+    autocast_calls = []
+
+    @contextmanager
+    def fake_context(*, enabled: bool):
+        autocast_calls.append(enabled)
+        yield
+
+    monkeypatch.setattr(trainer, "_autocast_context", lambda *, enabled: fake_context(enabled=enabled))
+    monkeypatch.setattr(
+        trainer_fa_module,
+        "complex_output_to_magnitude",
+        lambda output: complex_output_to_magnitude(output).to(torch.bfloat16),
+    )
+    capture_loss = CaptureL1Loss()
+    trainer.loss_fn = capture_loss
+
+    trainer.train_one_epoch(0)
+
+    assert autocast_calls == [True, True]
+    assert capture_loss.pred_dtype == torch.float32
+    assert capture_loss.target_dtype == torch.float32
+
+
+def test_fastmri_trainer_eval_disables_bf16_and_keeps_metric_arrays_fp32(monkeypatch, tmp_path: Path):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.max_epochs = 1
+    config.fastmri_finetune.use_bf16 = True
+
+    val_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    model = _build_wrapped_model("unet_only")
+    trainer = FastMRIFineTuneTrainer(
+        model=model,
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "bf16_eval",
+        train_loader=val_loader,
+        val_loader=val_loader,
+        test_loader=None,
+        metric_fns={
+            "psnr": lambda gt, pred: float(np.mean(gt - pred)),
+            "ssim": lambda gt, pred: float(np.mean(gt + pred)),
+            "nmse": lambda gt, pred: float(np.mean(gt * 0 + pred * 0)),
+        },
+        precision_state={"mode": "bf16", "use_bf16": True},
+    )
+
+    autocast_calls = []
+
+    @contextmanager
+    def fake_context(*, enabled: bool):
+        autocast_calls.append(enabled)
+        yield
+
+    monkeypatch.setattr(trainer, "_autocast_context", lambda *, enabled: fake_context(enabled=enabled))
+    monkeypatch.setattr(
+        trainer_fa_module,
+        "complex_output_to_magnitude",
+        lambda output: complex_output_to_magnitude(output).to(torch.bfloat16),
+    )
+
+    original_metadata_to_cpu_numpy = trainer._metadata_to_cpu_numpy
+    captured_prediction_dtypes = []
+    captured_target_dtypes = []
+
+    def wrapped_metadata_to_cpu_numpy(magnitude_prediction, magnitude_target, metadata):
+        volume_names, slice_indices, predictions, targets = original_metadata_to_cpu_numpy(
+            magnitude_prediction,
+            magnitude_target,
+            metadata,
+        )
+        captured_prediction_dtypes.extend(pred.dtype for pred in predictions)
+        captured_target_dtypes.extend(target.dtype for target in targets)
+        return volume_names, slice_indices, predictions, targets
+
+    monkeypatch.setattr(trainer, "_metadata_to_cpu_numpy", wrapped_metadata_to_cpu_numpy)
+
+    metrics = trainer.evaluate_loader(val_loader, split="val")
+
+    assert autocast_calls == [False, False]
+    assert set(metrics) == {"loss", "psnr", "ssim", "nmse"}
+    assert captured_prediction_dtypes == [np.float32, np.float32]
+    assert captured_target_dtypes == [np.float32, np.float32]

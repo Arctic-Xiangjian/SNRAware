@@ -14,6 +14,7 @@ from snraware.projects.mri.denoising.fastmri_compat import build_fastmri_wrapped
 from snraware.projects.mri.denoising.trainer_fa import (
     FastMRIFineTuneTrainer,
     build_fastmri_dataloaders,
+    resolve_fastmri_precision,
     seed_everything,
 )
 
@@ -30,6 +31,15 @@ def _resolve_device(device_str: str) -> torch.device:
         )
         return torch.device("cpu")
     return torch.device(device_str)
+
+
+def _normalized_wandb_entity(entity: object) -> str | None:
+    if entity is None:
+        return None
+    text = str(entity).strip()
+    if text == "" or text.lower() == "null":
+        return None
+    return text
 
 
 @hydra.main(version_base=None, config_path="./configs", config_name="fastmri_finetune")
@@ -67,17 +77,31 @@ def run_fastmri_finetuning(config: DictConfig):
     if config.logging.use_wandb:
         import wandb
 
-        wandb_run = wandb.init(
+        init_kwargs = dict(
             project=config.logging.project,
             name=run_name,
-            entity=config.logging.wandb_entity,
             dir=config.logging.wandb_dir,
             config=OmegaConf.to_container(config, resolve=True, throw_on_missing=False),
         )
+        wandb_entity = _normalized_wandb_entity(config.logging.get("wandb_entity"))
+        if wandb_entity is not None:
+            init_kwargs["entity"] = wandb_entity
+
+        wandb_run = wandb.init(**init_kwargs)
 
     train_loader, val_loader, test_loader = build_fastmri_dataloaders(config)
     device = _resolve_device(str(config.fastmri_finetune.device))
+    precision_state = resolve_fastmri_precision(
+        device,
+        use_bf16=bool(config.fastmri_finetune.use_bf16),
+    )
     crop_h, crop_w = [int(dim) for dim in config.fastmri_finetune.crop_size]
+
+    print(
+        f"{Fore.GREEN}Training precision: {precision_state['mode']} "
+        f"(validation/test remain fp32).{Style.RESET_ALL}",
+        flush=True,
+    )
 
     model, base_config, load_info = build_fastmri_wrapped_model(
         base_config_path=config.base_model.config_path,
@@ -102,6 +126,8 @@ def run_fastmri_finetuning(config: DictConfig):
         wandb_run.summary["base_weight_source"] = load_info["weight_source"]
         wandb_run.summary["base_matched_keys"] = load_info["matched_keys"]
         wandb_run.summary["base_mismatched_keys"] = load_info["mismatched_keys"]
+        wandb_run.summary["training_precision"] = precision_state["mode"]
+        wandb_run.summary["evaluation_precision"] = "fp32"
 
     trainer = FastMRIFineTuneTrainer(
         model=model,
@@ -112,6 +138,7 @@ def run_fastmri_finetuning(config: DictConfig):
         val_loader=val_loader,
         test_loader=test_loader,
         wandb_run=wandb_run,
+        precision_state=precision_state,
     )
 
     results = trainer.train()

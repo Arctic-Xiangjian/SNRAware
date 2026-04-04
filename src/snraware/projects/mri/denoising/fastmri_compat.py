@@ -426,7 +426,7 @@ def save_fastmri_finetune_checkpoint(
         "mode": mode,
         "epoch": epoch,
         "metrics": metrics or {},
-        "config": OmegaConf.to_container(config, resolve=True) if isinstance(config, DictConfig) else config,
+        "config": OmegaConf.to_container(config, resolve=False) if isinstance(config, DictConfig) else config,
         "lora_config": asdict(resolved_lora_config),
         "gfactor_unet": {key: value.detach().cpu() for key, value in model.gfactor_unet.state_dict().items()},
         "lora_adapter": extract_fastmri_adapter_state(model),
