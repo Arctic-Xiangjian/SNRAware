@@ -125,7 +125,7 @@ def _mock_config() -> DictConfig:
         "dataset": {"cutout_shape": [64, 64, 16]},
         "lora": {
             "enabled": True,
-            "r": 8,
+            "r": 4,
             "lora_alpha": 16.0,
             "lora_dropout": 0.0,
             "target_modules": [
@@ -438,7 +438,7 @@ def run_modality(
 
 def parse_args() -> argparse.Namespace:
     if torch.cuda.is_available():
-        default_device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+        default_device = "cuda:0" if torch.cuda.device_count() > 1 else "cuda:0"
     else:
         default_device = "cpu"
 
@@ -450,8 +450,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=114514)
+    parser.add_argument("--lora_r", type=int, default=4)
     parser.add_argument("--lora_alpha", type=float, default=16.0)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     return parser.parse_args()

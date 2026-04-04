@@ -1,0 +1,418 @@
+import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+from torch.utils.data import DataLoader
+# from torch.optim.lr_scheduler import CosineAnnealingLR
+
+import time
+import os
+import argparse
+import json
+import random
+import inspect
+import wandb
+import copy
+import numpy as np
+from tqdm import tqdm
+
+from data.warp_fastmri_singlecoil_x8 import MRIDataset
+from data.fastmri_data import SliceDataset
+
+
+from fastmri.evaluate import psnr, ssim, nmse
+
+
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+
+def _forward_model(model, img_lq, mask_we_use, lq_kspace, use_bf16):
+    if "use_bf16" in inspect.signature(model.forward).parameters:
+        return model(img_lq, mask_we_use, lq_kspace, use_bf16=use_bf16)
+    return model(img_lq, mask_we_use, lq_kspace)
+
+
+def train(
+    model,
+    train_loader,
+    val_loader,
+    test_loader,
+    optimizer,
+    criterion,
+    device,
+    epochs,
+    lr,
+    model_name,
+    loss_name,
+    save_dir,
+    args,
+    run_name,
+    ema_model=None,
+):
+    # current_time 
+    wandb.init(
+        project='fastMRI_with_ODE',
+        name=run_name,
+        config=vars(args),
+    )
+    best_psnr = float('-inf')
+    best_ssim = float('-inf')
+    best_nmse = float('inf')
+    best_psnr_ema = float('-inf')
+    model.train()
+    model = model.to(device)
+    best_psnr_model = copy.deepcopy(model)
+    best_ssim_model = copy.deepcopy(model)
+    best_nmse_model = copy.deepcopy(model)
+    best_psnr_ema_model = copy.deepcopy(ema_model.module) if ema_model is not None else None
+    epoch_psnr = -1
+    epoch_ssim = -1
+    epoch_nmse = -1
+    epoch_psnr_ema = -1
+    global_step = 0
+    os.makedirs(save_dir, exist_ok=True)
+
+    lr_scheduler_G = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    wandb.define_metric("custom_step")
+    # define which metrics will be plotted against it
+    wandb.define_metric("Val/PSNR", step_metric="custom_step")
+    wandb.define_metric("Val/SSIM", step_metric="custom_step")
+    wandb.define_metric("Val/nmse", step_metric="custom_step")
+    if ema_model is not None:
+        wandb.define_metric("Val/PSNR_EMA", step_metric="custom_step")
+        wandb.define_metric("Val/SSIM_EMA", step_metric="custom_step")
+        wandb.define_metric("Val/nmse_EMA", step_metric="custom_step")
+    for epoch in range(epochs):
+        loss_sum = 0
+        for i, (imgLQ, imgHQ, sampler) in tqdm(enumerate(train_loader), total=len(train_loader)):
+            # break # for debug
+            # imgLQ, imgHQ is double tensor need to convert to float tensor
+            # break # for debug
+            imgHQ = imgHQ.type(torch.FloatTensor)
+            imgLQ = imgLQ.type(torch.FloatTensor)
+            mask_we_use = sampler['mask'].to(device)
+            lq_kspace = sampler['masked_kspace'].to(device)
+            imgLQ, imgHQ = imgLQ.to(device), imgHQ.to(device)
+            optimizer.zero_grad()
+            output = _forward_model(model, imgLQ, mask_we_use, lq_kspace, args.use_bf16)
+            loss = criterion(output, imgHQ)
+            loss.backward()
+            optimizer.step()
+            if ema_model is not None:
+                ema_model.update(model)
+            loss_sum += loss.item()
+            
+
+
+            if (i+1) % 100 == 0:
+                wandb.log({'Train/Loss': loss_sum/100}, step=global_step)
+                loss_sum = 0
+
+
+            global_step += 1
+
+        psnr, ssim, nmse, *_ = test(model, val_loader, device, use_bf16=False) # keep validation evaluation in fp32 to avoid low-precision pollution
+        wandb.log({
+            'Val/PSNR': psnr,
+            'Val/SSIM': ssim,
+            'Val/nmse': nmse,
+            'custom_step': epoch
+        })
+        print(f'Epoch [{epoch+1}/{epochs}], PSNR: {psnr:.4f}, SSIM: {ssim:.4f}, nmse: {nmse:.4f}')
+        if psnr > best_psnr:
+            best_psnr_model = copy.deepcopy(model)
+            best_psnr = psnr
+            epoch_psnr = epoch
+            torch.save(best_psnr_model.state_dict(), os.path.join(save_dir, 'best_psnr_model.pth'))
+        if ssim > best_ssim:
+            best_ssim_model = copy.deepcopy(model)
+            best_ssim = ssim
+            epoch_ssim = epoch
+            torch.save(best_ssim_model.state_dict(), os.path.join(save_dir, 'best_ssim_model.pth'))
+        if nmse < best_nmse:
+            best_nmse_model = copy.deepcopy(model)
+            best_nmse = nmse
+            epoch_nmse = epoch
+            torch.save(best_nmse_model.state_dict(), os.path.join(save_dir, 'best_nmse_model.pth'))
+        if ema_model is not None:
+            psnr_ema, ssim_ema, nmse_ema, *_ = test(
+                ema_model.module,
+                val_loader,
+                device,
+                use_bf16=False, # keep EMA evaluation in fp32 to avoid low-precision pollution
+            )
+            wandb.log({
+                'Val/PSNR_EMA': psnr_ema,
+                'Val/SSIM_EMA': ssim_ema,
+                'Val/nmse_EMA': nmse_ema,
+                'custom_step': epoch
+            })
+            if psnr_ema > best_psnr_ema:
+                best_psnr_ema_model = copy.deepcopy(ema_model.module)
+                best_psnr_ema = psnr_ema
+                epoch_psnr_ema = epoch
+                torch.save(
+                    best_psnr_ema_model.state_dict(),
+                    os.path.join(save_dir, 'best_psnr_ema_model.pth'),
+                )
+        torch.save(model.state_dict(), os.path.join(save_dir, 'last.pth'))
+
+        lr_scheduler_G.step()
+        # print current learning rate
+        print(f'Learning rate: {optimizer.param_groups[0]["lr"]}')
+    best_psnr_model_psnr, best_psnr_model_ssim, best_psnr_model_nmse, best_psnr_model_psnr_std, best_psnr_model_ssim_std, best_psnr_model_nmse_std = test(best_psnr_model, test_loader, device, use_bf16=args.use_bf16)
+    if epoch_psnr != epoch_ssim:
+        best_ssim_model_psnr, best_ssim_model_ssim, best_ssim_model_nmse, best_ssim_model_psnr_std, best_ssim_model_ssim_std, best_ssim_model_nmse_std = test(best_ssim_model, test_loader, device, use_bf16=args.use_bf16)
+    else:
+        best_ssim_model_psnr, best_ssim_model_ssim, best_ssim_model_nmse, best_ssim_model_psnr_std, best_ssim_model_ssim_std, best_ssim_model_nmse_std = best_psnr_model_psnr, best_psnr_model_ssim, best_psnr_model_nmse, best_psnr_model_psnr_std, best_psnr_model_ssim_std, best_psnr_model_nmse_std
+    if epoch_nmse != epoch_ssim and epoch_nmse != epoch_psnr:
+        best_nmse_model_psnr, best_nmse_model_ssim, best_nmse_model_nmse, best_nmse_model_psnr_std, best_nmse_model_ssim_std, best_nmse_model_nmse_std = test(best_nmse_model, test_loader, device, use_bf16=args.use_bf16)
+    else:
+        best_nmse_model_psnr, best_nmse_model_ssim, best_nmse_model_nmse, best_nmse_model_psnr_std, best_nmse_model_ssim_std, best_nmse_model_nmse_std = best_psnr_model_psnr, best_psnr_model_ssim, best_psnr_model_nmse, best_psnr_model_psnr_std, best_psnr_model_ssim_std, best_psnr_model_nmse_std
+    if best_psnr_ema_model is not None:
+        best_psnr_ema_model_psnr, best_psnr_ema_model_ssim, best_psnr_ema_model_nmse, best_psnr_ema_model_psnr_std, best_psnr_ema_model_ssim_std, best_psnr_ema_model_nmse_std = test(
+            best_psnr_ema_model,
+            test_loader,
+            device,
+            use_bf16=args.use_bf16,
+        )
+        wandb.log({
+            'best_psnr_ema_model_psnr': best_psnr_ema_model_psnr,
+            'best_psnr_ema_model_ssim': best_psnr_ema_model_ssim,
+            'best_psnr_ema_model_nmse': best_psnr_ema_model_nmse,
+            'best_psnr_ema_model_psnr_std': best_psnr_ema_model_psnr_std,
+            'best_psnr_ema_model_ssim_std': best_psnr_ema_model_ssim_std,
+            'best_psnr_ema_model_nmse_std': best_psnr_ema_model_nmse_std,
+        })
+    wandb.log({'best_psnr_model_psnr': best_psnr_model_psnr, 'best_psnr_model_ssim': best_psnr_model_ssim, 'best_psnr_model_nmse': best_psnr_model_nmse, 'best_psnr_model_psnr_std': best_psnr_model_psnr_std, 'best_psnr_model_ssim_std': best_psnr_model_ssim_std, 'best_psnr_model_nmse_std': best_psnr_model_nmse_std, 'best_ssim_model_psnr': best_ssim_model_psnr, 'best_ssim_model_ssim': best_ssim_model_ssim, 'best_ssim_model_nmse': best_ssim_model_nmse, 'best_ssim_model_psnr_std': best_ssim_model_psnr_std, 'best_ssim_model_ssim_std': best_ssim_model_ssim_std, 'best_ssim_model_nmse_std': best_ssim_model_nmse_std, 'best_nmse_model_psnr': best_nmse_model_psnr, 'best_nmse_model_ssim': best_nmse_model_ssim, 'best_nmse_model_nmse': best_nmse_model_nmse, 'best_nmse_model_psnr_std': best_nmse_model_psnr_std, 'best_nmse_model_ssim_std': best_nmse_model_ssim_std, 'best_nmse_model_nmse_std': best_nmse_model_nmse_std})
+    wandb.log({'best_psnr_model_epoch': epoch_psnr, 'best_ssim_model_epoch': epoch_ssim, 'best_nmse_model_epoch': epoch_nmse})
+    if best_psnr_ema_model is not None:
+        wandb.log({'best_psnr_ema_model_epoch': epoch_psnr_ema})
+    wandb.finish()
+    print(f'Best PSNR model achieved at epoch {epoch_psnr}, PSNR: {best_psnr_model_psnr:.4f}, SSIM: {best_psnr_model_ssim:.4f}, nmse: {best_psnr_model_nmse:.4f}')
+    print(f'Best SSIM model achieved at epoch {epoch_ssim}, PSNR: {best_ssim_model_psnr:.4f}, SSIM: {best_ssim_model_ssim:.4f}, nmse: {best_ssim_model_nmse:.4f}')
+    print(f'Best nmse model achieved at epoch {epoch_nmse}, PSNR: {best_nmse_model_psnr:.4f}, SSIM: {best_nmse_model_ssim:.4f}, nmse: {best_nmse_model_nmse:.4f}')
+    if best_psnr_ema_model is not None:
+        print(f'Best EMA PSNR model achieved at epoch {epoch_psnr_ema}, PSNR: {best_psnr_ema_model_psnr:.4f}, SSIM: {best_psnr_ema_model_ssim:.4f}, nmse: {best_psnr_ema_model_nmse:.4f}')
+    return best_psnr_model, best_ssim_model, best_nmse_model, best_psnr_model_psnr, best_psnr_model_ssim, best_psnr_model_nmse, best_psnr_model_psnr_std, best_psnr_model_ssim_std, best_psnr_model_nmse_std, best_ssim_model_psnr, best_ssim_model_ssim, best_ssim_model_nmse, best_ssim_model_psnr_std, best_ssim_model_ssim_std, best_ssim_model_nmse_std, best_nmse_model_psnr, best_nmse_model_ssim, best_nmse_model_nmse, best_nmse_model_psnr_std, best_nmse_model_ssim_std, best_nmse_model_nmse_std
+
+
+def test(model, test_loader, device, use_bf16=False):
+    test_model = copy.deepcopy(model)
+    psnr_list = []
+    ssim_list = []
+    nmse_list = []
+    test_model = test_model.to(device)
+    test_model.eval()
+    cases_recon_Result = {}
+    cases_hq = {}
+    cases_lq = {}
+    file_name_list = []
+    hq_temp_list = []
+    recon_temp_list = []
+    # lq_temp_list = []
+    with torch.no_grad():
+        for i, (imgLQ, imgHQ, sampled) in tqdm(enumerate(test_loader), total=len(test_loader)):
+            imgHQ = imgHQ.type(torch.FloatTensor)
+            imgLQ = imgLQ.type(torch.FloatTensor)
+            imgLQ = imgLQ.to(device)
+            imgHQ = imgHQ.to(device)
+            mask_we_use = sampled['mask'].to(device)
+            lq_kspace = sampled['masked_kspace'].to(device)
+            output = _forward_model(test_model, imgLQ, mask_we_use, lq_kspace, use_bf16)
+            name = sampled['name']
+            name_list= [f.split('_slice_')[0] for f in name]
+            mean_current_batch = sampled['mean'].numpy().reshape(-1,1,1,1)
+            std_current_batch = sampled['std'].numpy().reshape(-1,1,1,1)
+            # de-normalize
+            # print(imgHQ.shape, std_current_batch.shape, mean_current_batch.shape)
+            imgHQ = imgHQ.cpu().numpy() * std_current_batch + mean_current_batch
+            output = output.cpu().numpy() * std_current_batch + mean_current_batch
+            # imgLQ = imgLQ.cpu().numpy() * std_current_batch + mean_current_batch
+            # print(name_list)
+            file_name_list.extend(name_list)
+            hq_temp_list.extend(imgHQ.squeeze())
+            recon_temp_list.extend(output.squeeze())
+            # print(imgHQ.shape, output.shape)
+            # lq_temp_list.extend(imgLQ.squeeze())
+            # print(len(file_name_list), len(hq_temp_list), len(recon_temp_list))
+        for idx,keys in enumerate(file_name_list):
+            if keys not in cases_hq:
+                cases_hq[keys] = []
+                cases_recon_Result[keys] = []
+                cases_lq[keys] = []
+            cases_hq[keys].append(hq_temp_list[idx])
+            cases_recon_Result[keys].append(recon_temp_list[idx])
+            # cases_lq[keys].append(lq_temp_list[idx])
+        for keys in tqdm(cases_hq.keys(), total=len(cases_hq.keys())):
+            hq_vol = np.stack(cases_hq[keys], axis=0)
+            recon_vol = np.stack(cases_recon_Result[keys], axis=0)
+            # hq_vol = hq_vol * 7.019048643996939e-05 
+            # hq_vol = hq_vol + 5.394078107201494e-05
+            # recon_vol = recon_vol * 7.019048643996939e-05
+            # recon_vol = recon_vol + 5.394078107201494e-05
+            # lq_vol = np.stack(cases_lq[keys], axis=0)
+            # lq_vol = lq_vol[:,0,:,: ]**2 + lq_vol[:,1,:,:]**2
+            # lq_vol = lq_vol.squeeze()
+            # lq_vol = np.sqrt(lq_vol)
+            # psnr_val = psnr(hq_vol, lq_vol)
+            # ssim_val = ssim(hq_vol, lq_vol)
+            # nmse_val = nmse(hq_vol, lq_vol)
+            # test use lq
+            psnr_val = psnr(hq_vol, recon_vol)
+            ssim_val = ssim(hq_vol, recon_vol)
+            nmse_val = nmse(hq_vol, recon_vol)
+            psnr_list.append(psnr_val)
+            ssim_list.append(ssim_val)
+            nmse_list.append(nmse_val)
+
+    return np.mean(psnr_list), np.mean(ssim_list), np.mean(nmse_list), np.std(psnr_list), np.std(ssim_list), np.std(nmse_list)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=60)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--save_dir', type=str, default='/v/ai/nobackup/arctic/Fastmri_ODE_checkpoint/checkpoints_fastmri')
+    # model can be selected from RWKV, DnCNN, Restoreformer
+    parser.add_argument('--model', type=str, default='baseline', choices=['baseline', 'no_ode_baseline', 'DnCNN', 'DnCNN_baseline'])
+    parser.add_argument('--lose_name', type=str, default='L1Loss', choices=['L1Loss', 'ssim'])
+    parser.add_argument('--continue_train', type=bool, default=False)
+    parser.add_argument('--model_path', type=str, default='none')
+    parser.add_argument('--patch_size', type=int, default=320)
+    parser.add_argument('--data_use_ratio', type=float, default=1.0)
+    parser.add_argument('--test_batch_size', type=int, default=8)
+    parser.add_argument('--use_bf16', action='store_true')
+    parser.add_argument('--use_ema', action='store_true')
+    parser.add_argument('--ema_decay', type=float, default=0.999)
+    parser.add_argument(
+        '--alpha',
+        type=str,
+        default='2',
+        choices=['0', '2', '4', '6', '8', '10', '15', '20', '40', '50', '100', 'inf'],
+    )
+    args = parser.parse_args()
+
+    with open('utils/window_list_singlex8.json', 'r') as f:
+        mask_dict = json.load(f)
+    current_mask_list = mask_dict[args.alpha]
+
+    
+    if args.model == 'baseline':
+        from models.nafnet import NAFNetUnrolled
+        model = NAFNetUnrolled(
+            img_channels=2,
+            width=32,
+            middle_blk_num=1,
+            enc_blk_nums=[1, 1, 1, 28],
+            dec_blk_nums=[1, 1, 1, 1],
+            mask_list=current_mask_list,
+        )
+    elif args.model == 'no_ode_baseline':
+        # this can be instead by alpha = inf in the NAFNetUnrolled, but we provide a separate no_ode_baseline becaseu it is already running and we don't want to re-run the NAFNetUnrolled with alpha = inf
+        from models.baseline import Baseline
+        model = Baseline(
+            img_channels=2,
+            width=32,
+            middle_blk_num=1,
+            enc_blk_nums=[1, 1, 1, 28],
+            dec_blk_nums=[1, 1, 1, 1],
+        )
+    elif args.model == 'DnCNN':
+        from models.DnCNN import DnCNNUnrolled
+        model = DnCNNUnrolled(img_channels=2)  # DnCNNUnrolled doesn't have the extra arguments
+    elif args.model == 'DnCNN_baseline':
+        from models.DnCNN_baseline import DnCNNUnrolledBaseline
+        model = DnCNNUnrolledBaseline(img_channels=2)  # DnCNNUnrolledBaseline doesn't have the extra arguments
+    # elif args.model == 'Unet':
+    #     from models.Unet import UNet
+    #     model = UNet(in_channels=2, out_channels=2, init_features=32)
+    else:
+        raise ValueError('model not found')
+    
+    if args.continue_train:
+        if args.model_path == 'none':
+            raise ValueError('model_path must be specified when continue_train is True')
+        model_path = args.model_path
+        model.load_state_dict(torch.load(model_path))
+
+    # set random seed
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    np.random.seed(42)
+    random.seed(42)
+
+    # set device
+    device = torch.device(args.device)
+
+    
+    # load data
+    train_data = MRIDataset(
+        SliceDataset(
+            root='/working2/arctic/VAR/data_fastmri/single_coil_knee/train',
+            latent_feature_root='/working2/arctic/prior_infor/single_coil_x8',
+            challenge='singlecoil',
+            volume_sample_rate=args.data_use_ratio,
+            sample_seed=42,
+        )
+    )
+    train_data.crop_size = args.patch_size
+    
+    test_data = MRIDataset(
+        SliceDataset(
+            root='/working2/arctic/VAR/data_fastmri/single_coil_knee/val',
+            latent_feature_root='/working2/arctic/prior_infor/single_coil_x8',
+            challenge='singlecoil',
+            sample_seed=42,
+        )
+    )
+    train_loader = DataLoader(
+    train_data,
+    batch_size=args.batch_size,
+    shuffle=True,
+    num_workers=8,
+    pin_memory=False,)
+    val_loader = DataLoader(test_data, batch_size=args.test_batch_size, shuffle=False, num_workers=4, pin_memory=False, persistent_workers=False)
+    test_loader = DataLoader(test_data, batch_size=args.test_batch_size, shuffle=False, num_workers=4, pin_memory=False, persistent_workers=False)
+
+    model.to(device)
+    ema_model = None
+    if args.use_ema:
+        from timm.utils import ModelEmaV2
+        ema_model = ModelEmaV2(model, decay=args.ema_decay)
+
+    # set optimizer and loss
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4)
+    # from loss.l1andssim import SSIM
+    if args.lose_name == 'L1Loss':
+        criterion = torch.nn.L1Loss().to(device)
+    elif args.lose_name == 'ssim':
+        raise NotImplementedError('ssim loss is not implemented yet')
+    else:
+        raise ValueError('loss not found')
+
+    # train model
+    current_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+    run_suffix = f"_a{args.alpha}_r{args.data_use_ratio}_bf16{args.use_bf16}_ema{args.use_ema}"
+    run_name = f"{args.model}x8_{run_suffix}_time_{current_time}"
+    save_dir = os.path.join(args.save_dir, f"{args.model}{run_suffix}", current_time, args.lose_name)
+    os.makedirs(save_dir, exist_ok=True)
+    best_psnr_model, best_ssim_model, best_nmse_model, best_psnr_model_psnr, best_psnr_model_ssim, best_psnr_model_nmse, best_psnr_model_psnr_std, best_psnr_model_ssim_std, best_psnr_model_nmse_std, best_ssim_model_psnr, best_ssim_model_ssim, best_ssim_model_nmse, best_ssim_model_psnr_std, best_ssim_model_ssim_std, best_ssim_model_nmse_std, best_nmse_model_psnr, best_nmse_model_ssim, best_nmse_model_nmse, best_nmse_model_psnr_std, best_nmse_model_ssim_std, best_nmse_model_nmse_std = train(model, train_loader, val_loader, test_loader, optimizer, criterion, device, args.epochs, args.lr, args.model, args.lose_name, save_dir, args, run_name, ema_model=ema_model)
+
+    # run over time
+    torch.save(best_psnr_model.state_dict(), os.path.join(save_dir, 'best_psnr_model.pth'))
+    torch.save(best_ssim_model.state_dict(), os.path.join(save_dir, 'best_ssim_model.pth'))
+    torch.save(best_nmse_model.state_dict(), os.path.join(save_dir, 'best_nmse_model.pth'))
+    json_name = os.path.join(save_dir, 'result.json')
+    # make the nuber tofloat8
+    best_psnr_model_psnr, best_psnr_model_ssim, best_psnr_model_nmse, best_psnr_model_psnr_std, best_psnr_model_ssim_std, best_psnr_model_nmse_std = float(best_psnr_model_psnr), float(best_psnr_model_ssim), float(best_psnr_model_nmse), float(best_psnr_model_psnr_std), float(best_psnr_model_ssim_std), float(best_psnr_model_nmse_std)
+
+    best_ssim_model_psnr, best_ssim_model_ssim, best_ssim_model_nmse, best_ssim_model_psnr_std, best_ssim_model_ssim_std, best_ssim_model_nmse_std = float(best_ssim_model_psnr), float(best_ssim_model_ssim), float(best_ssim_model_nmse), float(best_ssim_model_psnr_std), float(best_ssim_model_ssim_std),   float(best_ssim_model_nmse_std)
+
+    best_nmse_model_psnr, best_nmse_model_ssim, best_nmse_model_nmse, best_nmse_model_psnr_std, best_nmse_model_ssim_std, best_nmse_model_nmse_std = float(best_nmse_model_psnr), float(best_nmse_model_ssim), float(best_nmse_model_nmse), float(best_nmse_model_psnr_std), float(best_nmse_model_ssim_std), float(best_nmse_model_nmse_std)
+    with open(json_name, 'w') as f:
+        json.dump({'best_psnr_model_psnr': best_psnr_model_psnr, 'best_psnr_model_ssim': best_psnr_model_ssim, 'best_psnr_model_nmse': best_psnr_model_nmse, 'best_psnr_model_psnr_std': best_psnr_model_psnr_std, 'best_psnr_model_ssim_std': best_psnr_model_ssim_std, 'best_psnr_model_nmse_std': best_psnr_model_nmse_std, 'best_ssim_model_psnr': best_ssim_model_psnr, 'best_ssim_model_ssim': best_ssim_model_ssim, 'best_ssim_model_nmse': best_ssim_model_nmse, 'best_ssim_model_psnr_std': best_ssim_model_psnr_std, 'best_ssim_model_ssim_std': best_ssim_model_ssim_std, 'best_ssim_model_nmse_std': best_ssim_model_nmse_std, 'best_nmse_model_psnr': best_nmse_model_psnr, 'best_nmse_model_ssim': best_nmse_model_ssim, 'best_nmse_model_nmse': best_nmse_model_nmse, 'best_nmse_model_psnr_std': best_nmse_model_psnr_std, 'best_nmse_model_ssim_std': best_nmse_model_ssim_std, 'best_nmse_model_nmse_std': best_nmse_model_nmse_std}, f)
