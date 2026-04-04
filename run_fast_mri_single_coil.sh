@@ -32,7 +32,7 @@ run_fast_mri_single_coil.sh
 Environment variables you can change:
   CUDA_DEVICE            Physical GPU id to expose. Default: 0
   DEVICE                 Torch device passed to Hydra. Default: cuda:0
-  PYTHON_BIN             Python executable. Auto-detected if unset.
+  UV_BIN                 uv executable. Default: uv
 
   TRAIN_ROOT             FastMRI single-coil train folder.
   VAL_ROOT               FastMRI single-coil val folder.
@@ -60,7 +60,7 @@ Environment variables you can change:
   DETERMINISTIC_MASK     Default: true
 
 Examples:
-  CUDA_DEVICE=2 ./run_fast_mri_single_coil.sh
+  CUDA_DEVICE=0 ./run_fast_mri_single_coil.sh
   SAMPLE_RATE=null MAX_EPOCHS=20 WARMUP_EPOCHS=5 ./run_fast_mri_single_coil.sh
   ./run_fast_mri_single_coil.sh 1 lora.r=16 fastmri_finetune.batch_size=2
 EOF
@@ -77,22 +77,10 @@ if [[ $# -gt 0 && "${1}" != *=* && "${1}" != --* ]]; then
   shift
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-}"
-if [[ -z "${PYTHON_BIN}" ]]; then
-  for candidate in python python3 /usr/bin/python3.12 /usr/bin/python3.11; do
-    if command -v "${candidate}" >/dev/null 2>&1; then
-      PYTHON_BIN="${candidate}"
-      break
-    fi
-    if [[ -x "${candidate}" ]]; then
-      PYTHON_BIN="${candidate}"
-      break
-    fi
-  done
-fi
-
-if [[ -z "${PYTHON_BIN}" ]]; then
-  echo "Could not find a usable Python executable. Set PYTHON_BIN and retry." >&2
+UV_BIN="${UV_BIN:-uv}"
+if ! command -v "${UV_BIN}" >/dev/null 2>&1; then
+  echo "Could not find uv executable: ${UV_BIN}" >&2
+  echo "Install uv or set UV_BIN=/full/path/to/uv and retry." >&2
   exit 1
 fi
 
@@ -160,10 +148,8 @@ if [[ "${DEVICE}" != cpu* ]]; then
   export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${CUDA_DEVICE_DEFAULT}}"
 fi
 
-export PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
-
 echo "Running FastMRI single-coil fine-tune with:"
-echo "  PYTHON_BIN=${PYTHON_BIN}"
+echo "  UV_BIN=${UV_BIN}"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "  DEVICE=${DEVICE}"
 echo "  TRAIN_ROOT=${TRAIN_ROOT}"
@@ -177,7 +163,7 @@ echo "  SAMPLE_RATE=${SAMPLE_RATE}"
 echo "  SAVE_ROOT=${SAVE_ROOT}"
 
 CMD=(
-  "${PYTHON_BIN}" -m snraware.projects.mri.denoising.train
+  "${UV_BIN}" run python -m snraware.projects.mri.denoising.train
   "base_model.config_path=${BASE_MODEL_CONFIG}"
   "base_model.checkpoint_path=${BASE_MODEL_CHECKPOINT}"
   "logging.use_wandb=${USE_WANDB}"
@@ -222,7 +208,8 @@ if [[ $# -gt 0 ]]; then
   CMD+=("$@")
 fi
 
-printf 'Command:\n  %q' "${CMD[@]}"
+printf 'Command:\n  '
+printf '%q ' "${CMD[@]}"
 printf '\n'
 
 exec "${CMD[@]}"

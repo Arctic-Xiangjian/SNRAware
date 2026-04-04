@@ -1013,6 +1013,27 @@ wheels = [
 ]
 
 [[package]]
+name = "fastmri"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "h5py" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pytorch-lightning" },
+    { name = "pyyaml" },
+    { name = "runstats" },
+    { name = "scikit-image" },
+    { name = "torch" },
+    { name = "torchmetrics" },
+    { name = "torchvision" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2b/c1/fe4618ba62dd80c1238fc708777bee4d970ba53397ee273a7011111a5e02/fastmri-0.3.0.tar.gz", hash = "sha256:d7a566e5a15f8809baa8924eab8890c232bdf4b04905e53869398bfc610fe1e7", size = 721721, upload-time = "2023-06-26T17:18:10.904Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/73/2141c54dde7c867268063d86bc66d34b375179ffd2220b1953452e99ae37/fastmri-0.3.0-py3-none-any.whl", hash = "sha256:b7a3582868f6fae487d362905db30121caeebef20a98964c1a3445a512d4533c", size = 58140, upload-time = "2023-06-26T17:18:09.271Z" },
+]
+
+[[package]]
 name = "filelock"
 version = "3.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3487,6 +3508,12 @@ wheels = [
 ]
 
 [[package]]
+name = "runstats"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/00/f0ce323f237e31a36bf65fa398d4210a579173e2aebda8f9c2ca60d04288/runstats-2.0.0.tar.gz", hash = "sha256:0f9a5e6cc9938bbac3474b17727ffc29fbf5895f33e55ce8843341e0821e77c2", size = 101379, upload-time = "2021-06-11T05:04:20.634Z" }
+
+[[package]]
 name = "scikit-image"
 version = "0.25.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3726,6 +3753,7 @@ dependencies = [
     { name = "click" },
     { name = "dvc", extra = ["azure"] },
     { name = "einops" },
+    { name = "fastmri" },
     { name = "h5py" },
     { name = "hydra-colorlog" },
     { name = "hydra-core" },
@@ -3784,6 +3812,7 @@ requires-dist = [
     { name = "click" },
     { name = "dvc", extras = ["azure"] },
     { name = "einops" },
+    { name = "fastmri" },
     { name = "h5py" },
     { name = "hydra-colorlog" },
     { name = "hydra-core" },

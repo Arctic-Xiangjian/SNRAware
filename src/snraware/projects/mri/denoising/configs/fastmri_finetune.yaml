@@ -1,6 +1,63 @@
+# Configuration for FastMRI fine-tuning with SNRAware
+
+hydra:
+  run:
+    dir: ./.run/${now:%Y-%m-%d}--${now:%H-%M-%S}
+
+  searchpath:
+    - file://./src/snraware/components/configs
+
 defaults:
-  - config
+  - backbone: hrnet
+  - optim: sophia
+  - scheduler: OneCycleLR
+  - dataset: dataset_base
+  - trainer: lightning
+  - logging: logging_base
+  - heads: base_heads
   - _self_
+  - override hydra/job_logging: colorlog
+  - override hydra/hydra_logging: colorlog
+
+backbone:
+  num_of_channels: 64
+  block_str: ["T1L1G1", "T1L1G1"]
+  block:
+    cell:
+      window_size: [8, 8, 16]
+      patch_size: [4, 4, 2]
+      norm_mode: layer
+      n_head: 64
+
+optim:
+  lr: 1e-5
+  weight_decay: 0.0
+
+step_mode:
+  total_steps: 0
+  steps_to_report: 500
+  steps_to_timing: 3000
+  steps_to_validate: 30000
+  steps_to_save_ckpts: 30000
+
+train_data_dir: "./test/data/mri/denoising/tra"
+test_data_dir: "./test/data/mri/denoising/test"
+
+seed: null
+
+batch_size: 1
+num_workers: 8
+prefetch_factor: 8
+
+loss: ["mse", "perpendicular", "perceptual", "charbonnier", "gaussian3d"]
+loss_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
+
+scale_model_output_with_noise_level: false
+
+val_data_portion: 0.04
+overlap_for_inference: [16, 16, 8]
+
+device_mesh: [2, 2]
 
 dataset:
   cutout_shape: [320, 320, 1]
@@ -44,7 +101,7 @@ fastmri_finetune:
   pin_memory: true
   persistent_workers: false
   shuffle_train: true
-  mode: "unet_and_lora"
+  mode: "warmup_then_both"
   max_epochs: 20
   warmup_epochs: 5
   unet_lr: 1.0e-4
