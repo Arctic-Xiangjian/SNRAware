@@ -11,6 +11,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint_utils
 from omegaconf import DictConfig, OmegaConf
 
 from snraware.projects.mri.denoising.lora_utils import (
@@ -249,18 +250,45 @@ class SNRAwareWithGFactor(nn.Module):
         gfactor = torch.abs(self.gfactor_unet(complex_last))
         return gfactor
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_base_model(
+        self,
+        x_with_gfactor: torch.Tensor,
+        *,
+        checkpoint_base_model: bool = False,
+    ) -> torch.Tensor:
+        if checkpoint_base_model:
+            return checkpoint_utils.checkpoint(
+                self.base_model,
+                x_with_gfactor,
+                use_reentrant=False,
+            )
+        return self.base_model(x_with_gfactor)
+
+    def forward_fastmri_2ch(
+        self,
+        x: torch.Tensor,
+        *,
+        checkpoint_base_model: bool = False,
+    ) -> torch.Tensor:
+        x = self._prepare_2ch_input(x)
+        gfactor = self.predict_gfactor(x).unsqueeze(2)
+        x_with_gfactor = torch.cat([x, gfactor], dim=1)
+        return self._forward_base_model(
+            x_with_gfactor,
+            checkpoint_base_model=checkpoint_base_model,
+        )
+
+    def forward(self, x: torch.Tensor, *, checkpoint_base_model: bool = False) -> torch.Tensor:
         if x.ndim == 5 and x.shape[1] == 3:
             return self.base_model(x)
         if x.ndim == 4 and x.shape[1] == 3:
             return self.base_model(x.unsqueeze(2))
         if x.shape[1] != 2:
             raise ValueError(f"Expected 2 or 3 channels, got shape {tuple(x.shape)}")
-
-        x = self._prepare_2ch_input(x)
-        gfactor = self.predict_gfactor(x).unsqueeze(2)
-        x_with_gfactor = torch.cat([x, gfactor], dim=1)
-        return self.base_model(x_with_gfactor)
+        return self.forward_fastmri_2ch(
+            x,
+            checkpoint_base_model=checkpoint_base_model,
+        )
 
 
 def _replace_legacy_targets(obj: Any) -> Any:
@@ -408,6 +436,7 @@ def save_fastmri_finetune_checkpoint(
     checkpoint_path: str | Path,
     *,
     mode: str,
+    adapters_active: bool | None = None,
     config: Any | None = None,
     lora_config: Any | None = None,
     epoch: int | None = None,
@@ -424,6 +453,7 @@ def save_fastmri_finetune_checkpoint(
     payload = {
         "checkpoint_type": FASTMRI_FINETUNE_CHECKPOINT_TYPE,
         "mode": mode,
+        "adapters_active": bool(adapters_active) if adapters_active is not None else None,
         "epoch": epoch,
         "metrics": metrics or {},
         "config": OmegaConf.to_container(config, resolve=False) if isinstance(config, DictConfig) else config,
@@ -466,7 +496,8 @@ def load_fastmri_finetune_checkpoint(
     resolved_lora_config = lora_config if lora_config is not None else payload.get("lora_config")
     if lora_config is not None and not resolve_lora_config(lora_config=lora_config).enabled:
         resolved_lora_config = payload.get("lora_config", lora_config)
-    apply_lora_fn(model.base_model, lora_config=resolved_lora_config)
+    if not has_lora_adapters(model.base_model):
+        apply_lora_fn(model.base_model, lora_config=resolved_lora_config)
     missing, unexpected = model.base_model.load_state_dict(lora_state, strict=False)
     filtered_missing = [name for name in missing if _is_adapter_state_key(name)]
     return filtered_missing, unexpected

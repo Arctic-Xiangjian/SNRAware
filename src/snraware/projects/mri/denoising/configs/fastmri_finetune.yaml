@@ -117,6 +117,7 @@ fastmri_finetune:
   evaluate_every_n_epochs: 1
   device: "auto"
   use_bf16: true
+  gradient_checkpoint_frozen_base: true
   gfactor_unet:
     in_chans: 2
     out_chans: 1

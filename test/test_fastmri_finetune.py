@@ -22,6 +22,7 @@ from snraware.projects.mri.denoising.fastmri_compat import (
     load_fastmri_finetune_checkpoint,
     save_fastmri_finetune_checkpoint,
 )
+import snraware.projects.mri.denoising.fastmri_compat as fastmri_compat_module
 from snraware.projects.mri.denoising.lora_utils import apply_lora_to_model
 from snraware.projects.mri.denoising.model import DenoisingModel
 import snraware.projects.mri.denoising.trainer_fa as trainer_fa_module
@@ -70,6 +71,7 @@ def _tiny_config(mode: str):
             "log_every_n_steps": 100,
             "evaluate_every_n_epochs": 1,
             "use_bf16": False,
+            "gradient_checkpoint_frozen_base": True,
         }
     )
     return cfg
@@ -171,6 +173,35 @@ class CaptureL1Loss(torch.nn.Module):
         self.pred_dtype = pred.dtype
         self.target_dtype = target.dtype
         return torch.nn.functional.l1_loss(pred, target)
+
+
+def _adapter_trainable_names(model: SNRAwareWithGFactor) -> list[str]:
+    return [
+        name
+        for name, parameter in model.base_model.named_parameters()
+        if (".lora_" in name or name.startswith("pre.") or name.startswith("post."))
+        and parameter.requires_grad
+    ]
+
+
+def _backbone_trainable_names(model: SNRAwareWithGFactor) -> list[str]:
+    return [
+        name
+        for name, parameter in model.base_model.named_parameters()
+        if ".lora_" not in name and not name.startswith("pre.") and not name.startswith("post.")
+        and parameter.requires_grad
+    ]
+
+
+def _gfactor_is_trainable(model: SNRAwareWithGFactor) -> bool:
+    return any(parameter.requires_grad for parameter in model.gfactor_unet.parameters())
+
+
+def _adapter_group_lr(trainer: FastMRIFineTuneTrainer) -> float | None:
+    for group in trainer.optimizer.param_groups:
+        if group.get("name") == "adapter":
+            return float(group["lr"])
+    return None
 
 
 def test_wrapper_routes_2ch_input_through_gfactor_head():
@@ -344,6 +375,72 @@ def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path)
             assert torch.equal(parameter, backbone_snapshot[_clean_lora_wrapped_name(name)])
 
 
+def test_fastmri_checkpoint_payload_records_adapters_active(tmp_path: Path):
+    model = _build_wrapped_model("warmup_then_both")
+    configure_model_for_finetune_mode(
+        model,
+        mode="warmup_then_both",
+        lora_config=model.base_model.config.lora,
+        adapters_active=False,
+    )
+
+    checkpoint_path = tmp_path / "warmup_state.pth"
+    save_fastmri_finetune_checkpoint(
+        model,
+        checkpoint_path,
+        mode="warmup_then_both",
+        adapters_active=False,
+        config=model.base_model.config,
+        lora_config=model.base_model.config.lora,
+        epoch=0,
+    )
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    assert payload["adapters_active"] is False
+
+
+def test_fastmri_checkpoint_loader_skips_duplicate_lora_injection(tmp_path: Path):
+    torch.manual_seed(7)
+    model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        model,
+        mode="unet_and_lora",
+        lora_config=model.base_model.config.lora,
+    )
+
+    checkpoint_path = tmp_path / "already_adapted.pth"
+    save_fastmri_finetune_checkpoint(
+        model,
+        checkpoint_path,
+        mode="unet_and_lora",
+        adapters_active=True,
+        config=model.base_model.config,
+        lora_config=model.base_model.config.lora,
+        epoch=0,
+    )
+    payload = torch.load(checkpoint_path, map_location="cpu")
+
+    fresh_model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        fresh_model,
+        mode="unet_and_lora",
+        lora_config=fresh_model.base_model.config.lora,
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("LoRA injection should be skipped when adapters already exist")
+
+    missing, unexpected = load_fastmri_finetune_checkpoint(
+        fresh_model,
+        payload,
+        apply_lora_fn=fail_if_called,
+        lora_config=fresh_model.base_model.config.lora,
+    )
+
+    assert missing == []
+    assert unexpected == []
+
+
 def test_fastmri_bridge_dataset_returns_expected_shapes_and_legacy_normalization(tmp_path: Path):
     data_dir = tmp_path / "singlecoil_train"
     data_dir.mkdir()
@@ -432,6 +529,276 @@ def test_run_fastmri_launcher_exposes_use_bf16():
     assert 'USE_BF16="${USE_BF16:-true}"' in script
     assert '"fastmri_finetune.use_bf16=${USE_BF16}"' in script
     assert "USE_BF16=false ./run_fast_mri_single_coil.sh" in script
+
+
+@pytest.mark.parametrize(
+    ("mode", "expect_gfactor_trainable", "expect_adapter_trainable"),
+    [
+        ("unet_only", True, False),
+        ("unet_and_lora", True, True),
+        ("lora_only", False, True),
+    ],
+)
+def test_resume_reconciles_mode_trainable_state(
+    mode: str,
+    expect_gfactor_trainable: bool,
+    expect_adapter_trainable: bool,
+    tmp_path: Path,
+):
+    config = _tiny_config(mode)
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model(mode),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / f"{mode}_save",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+    checkpoint_path = trainer._save_checkpoint(tmp_path / f"{mode}.pth", epoch=0, metrics={})
+
+    resumed_config = _tiny_config(mode)
+    resumed_config.fastmri_finetune.resume_from = str(checkpoint_path)
+    resumed_trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model(mode),
+        config=resumed_config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / f"{mode}_resume",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    assert _gfactor_is_trainable(resumed_trainer.model) is expect_gfactor_trainable
+    assert bool(_adapter_trainable_names(resumed_trainer.model)) is expect_adapter_trainable
+    assert _backbone_trainable_names(resumed_trainer.model) == []
+
+
+def test_resume_reconciles_warmup_then_both_before_activation(tmp_path: Path):
+    config = _tiny_config("warmup_then_both")
+    config.fastmri_finetune.warmup_epochs = 2
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("warmup_then_both"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "warmup_save",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+    checkpoint_path = trainer._save_checkpoint(tmp_path / "warmup_false.pth", epoch=0, metrics={})
+
+    resumed_config = _tiny_config("warmup_then_both")
+    resumed_config.fastmri_finetune.warmup_epochs = 2
+    resumed_config.fastmri_finetune.resume_from = str(checkpoint_path)
+    resumed_trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("warmup_then_both"),
+        config=resumed_config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "warmup_resume",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    assert resumed_trainer.mode_state["adapters_active"] is False
+    assert _gfactor_is_trainable(resumed_trainer.model) is True
+    assert _adapter_trainable_names(resumed_trainer.model) == []
+    assert _backbone_trainable_names(resumed_trainer.model) == []
+    assert _adapter_group_lr(resumed_trainer) == 0.0
+
+
+def test_resume_reconciles_warmup_then_both_after_activation(tmp_path: Path):
+    config = _tiny_config("warmup_then_both")
+    config.fastmri_finetune.warmup_epochs = 1
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("warmup_then_both"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "warmup_active_save",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+    trainer._maybe_activate_adapters(epoch=1)
+    checkpoint_path = trainer._save_checkpoint(tmp_path / "warmup_true.pth", epoch=1, metrics={})
+
+    resumed_config = _tiny_config("warmup_then_both")
+    resumed_config.fastmri_finetune.warmup_epochs = 1
+    resumed_config.fastmri_finetune.resume_from = str(checkpoint_path)
+    resumed_trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("warmup_then_both"),
+        config=resumed_config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "warmup_active_resume",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    assert resumed_trainer.mode_state["adapters_active"] is True
+    assert _gfactor_is_trainable(resumed_trainer.model) is True
+    assert bool(_adapter_trainable_names(resumed_trainer.model)) is True
+    assert _backbone_trainable_names(resumed_trainer.model) == []
+    assert _adapter_group_lr(resumed_trainer) == pytest.approx(float(config.fastmri_finetune.adapter_lr))
+
+
+def test_resume_rejects_mode_mismatch(tmp_path: Path):
+    source_config = _tiny_config("unet_and_lora")
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_and_lora"),
+        config=source_config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "mismatch_save",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+    checkpoint_path = trainer._save_checkpoint(tmp_path / "mismatch.pth", epoch=0, metrics={})
+
+    resumed_config = _tiny_config("lora_only")
+    resumed_config.fastmri_finetune.resume_from = str(checkpoint_path)
+
+    with pytest.raises(ValueError, match="resume mode mismatch"):
+        FastMRIFineTuneTrainer(
+            model=_build_wrapped_model("lora_only"),
+            config=resumed_config,
+            device=torch.device("cpu"),
+            run_dir=tmp_path / "mismatch_resume",
+            train_loader=train_loader,
+            val_loader=None,
+            test_loader=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "epoch", "expect_checkpoint"),
+    [
+        ("unet_only", 0, True),
+        ("unet_and_lora", 0, False),
+        ("lora_only", 0, False),
+        ("warmup_then_both", 0, True),
+        ("warmup_then_both", 1, False),
+    ],
+)
+def test_train_gradient_checkpointing_only_runs_for_frozen_base(
+    mode: str,
+    epoch: int,
+    expect_checkpoint: bool,
+    monkeypatch,
+    tmp_path: Path,
+):
+    config = _tiny_config(mode)
+    config.fastmri_finetune.warmup_epochs = 1
+    train_loader = DataLoader(ToyFastMRIDataset(1), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model(mode),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / f"{mode}_gc",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    checkpoint_calls = []
+
+    def fake_checkpoint(function, *args, **kwargs):
+        checkpoint_calls.append(kwargs)
+        return function(*args)
+
+    monkeypatch.setattr(fastmri_compat_module.checkpoint_utils, "checkpoint", fake_checkpoint)
+
+    trainer.train_one_epoch(epoch)
+
+    assert bool(checkpoint_calls) is expect_checkpoint
+    if expect_checkpoint:
+        assert checkpoint_calls == [{"use_reentrant": False}]
+
+
+def test_eval_never_uses_gradient_checkpointing(monkeypatch, tmp_path: Path):
+    config = _tiny_config("unet_only")
+    loader = DataLoader(ToyFastMRIDataset(1), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_only"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "eval_gc",
+        train_loader=loader,
+        val_loader=loader,
+        test_loader=None,
+        metric_fns={
+            "psnr": lambda gt, pred: float(np.mean(gt - pred)),
+            "ssim": lambda gt, pred: float(np.mean(gt + pred)),
+            "nmse": lambda gt, pred: float(np.mean(pred * 0)),
+        },
+    )
+
+    checkpoint_calls = []
+
+    def fake_checkpoint(function, *args, **kwargs):
+        checkpoint_calls.append(kwargs)
+        return function(*args)
+
+    monkeypatch.setattr(fastmri_compat_module.checkpoint_utils, "checkpoint", fake_checkpoint)
+
+    trainer.evaluate_loader(loader, split="val")
+
+    assert checkpoint_calls == []
+
+
+def test_gradient_checkpointing_keeps_gfactor_gradients():
+    model = _build_wrapped_model("unet_only")
+    configure_model_for_finetune_mode(model, mode="unet_only", lora_config=model.base_model.config.lora)
+
+    noisy = torch.randn(1, 2, 32, 32, dtype=torch.float32)
+    output = model(noisy, checkpoint_base_model=True)
+    loss = complex_output_to_magnitude(output).sum()
+    loss.backward()
+
+    assert any(parameter.grad is not None for parameter in model.gfactor_unet.parameters())
+
+
+def test_denoising_model_forward_backward_smoke():
+    config = _tiny_config("unet_only")
+    model = DenoisingModel(config=config, D=1, H=32, W=32)
+    noisy = torch.randn(1, 3, 1, 32, 32, dtype=torch.float32, requires_grad=True)
+
+    output = model(noisy)
+    loss = output.sum()
+    loss.backward()
+
+    assert output.shape == (1, 2, 1, 32, 32)
+    assert noisy.grad is not None
+
+
+def test_warmup_activation_updates_scheduler_base_lrs(tmp_path: Path):
+    config = _tiny_config("warmup_then_both")
+    config.fastmri_finetune.warmup_epochs = 1
+    config.fastmri_finetune.scheduler_t_max = 4
+    train_loader = DataLoader(ToyFastMRIDataset(1), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("warmup_then_both"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "warmup_sched",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    assert trainer.scheduler is not None
+    assert _adapter_group_lr(trainer) == 0.0
+    assert trainer.scheduler.base_lrs[1] == 0.0
+
+    trainer._maybe_activate_adapters(epoch=1)
+
+    assert _adapter_group_lr(trainer) == pytest.approx(float(config.fastmri_finetune.adapter_lr))
+    assert trainer.scheduler.base_lrs[1] == pytest.approx(float(config.fastmri_finetune.adapter_lr))
 
 
 @pytest.mark.parametrize("mode", ["unet_only", "unet_and_lora"])

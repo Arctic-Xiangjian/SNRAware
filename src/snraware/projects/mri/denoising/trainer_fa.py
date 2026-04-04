@@ -116,12 +116,14 @@ def configure_model_for_finetune_mode(
     *,
     mode: str,
     lora_config: Any | None = None,
+    adapters_active: bool | None = None,
 ) -> dict[str, Any]:
     """Configure trainable parameters for the requested FastMRI fine-tune mode."""
     supported_modes = {"unet_only", "unet_and_lora", "lora_only", "warmup_then_both"}
     if mode not in supported_modes:
         raise ValueError(f"Unsupported fine-tune mode: {mode}")
 
+    requested_adapters_active = adapters_active
     adapters_active = False
     if mode == "unet_only":
         _set_module_trainable(model.base_model, False)
@@ -134,7 +136,10 @@ def configure_model_for_finetune_mode(
         if not resolved.enabled:
             raise ValueError(f"LoRA must be enabled for fine-tune mode '{mode}'")
 
-        apply_lora_to_model(model.base_model, lora_config=lora_config)
+        if not has_lora_adapters(model.base_model):
+            apply_lora_to_model(model.base_model, lora_config=lora_config)
+        else:
+            _set_module_trainable(model.base_model, False)
 
         if mode == "unet_and_lora":
             _set_module_trainable(model.gfactor_unet, True)
@@ -146,7 +151,10 @@ def configure_model_for_finetune_mode(
             adapters_active = True
         else:
             _set_module_trainable(model.gfactor_unet, True)
-            _set_adapter_trainable(model.base_model, False)
+            adapters_active = (
+                bool(requested_adapters_active) if requested_adapters_active is not None else False
+            )
+            _set_adapter_trainable(model.base_model, adapters_active)
 
     return {
         "mode": mode,
@@ -322,6 +330,9 @@ class FastMRIFineTuneTrainer:
         )
         self.use_bf16 = bool(self.precision_state["use_bf16"])
         self.precision_mode = str(self.precision_state["mode"])
+        self.gradient_checkpoint_frozen_base = bool(
+            self.ft_cfg.get("gradient_checkpoint_frozen_base", True)
+        )
         self.model = model.to(device=device, dtype=torch.float32)
         self.run_dir = Path(run_dir)
         self.train_loader = train_loader
@@ -384,8 +395,53 @@ class FastMRIFineTuneTrainer:
             return None
         return torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max)
 
+    def _sync_optimizer_learning_rates(self) -> None:
+        for group in self.optimizer.param_groups:
+            group["weight_decay"] = float(self.ft_cfg.weight_decay)
+            if group.get("name") == "gfactor_unet":
+                group["lr"] = float(self.ft_cfg.unet_lr)
+            elif group.get("name") == "adapter":
+                group["lr"] = (
+                    0.0
+                    if self.ft_cfg.mode == "warmup_then_both" and not self.mode_state["adapters_active"]
+                    else float(self.ft_cfg.adapter_lr)
+                )
+        if self.scheduler is not None and hasattr(self.scheduler, "base_lrs"):
+            for index, group in enumerate(self.optimizer.param_groups):
+                if group.get("name") == "gfactor_unet":
+                    self.scheduler.base_lrs[index] = float(self.ft_cfg.unet_lr)
+                elif group.get("name") == "adapter":
+                    self.scheduler.base_lrs[index] = float(group["lr"])
+
+    def _resolve_resume_adapters_active(self, payload: dict[str, Any]) -> bool:
+        if self.ft_cfg.mode != "warmup_then_both":
+            return self.ft_cfg.mode != "unet_only"
+
+        stored = payload.get("adapters_active", None)
+        if stored is not None:
+            return bool(stored)
+
+        saved_epoch = int(payload.get("epoch", -1))
+        return saved_epoch >= int(self.ft_cfg.warmup_epochs)
+
+    def _reconcile_mode_state_after_resume(self, payload: dict[str, Any]) -> None:
+        adapters_active = self._resolve_resume_adapters_active(payload)
+        self.mode_state = configure_model_for_finetune_mode(
+            self.model,
+            mode=self.ft_cfg.mode,
+            lora_config=self.config.get("lora"),
+            adapters_active=adapters_active,
+        )
+        self._sync_optimizer_learning_rates()
+
     def _load_resume_state(self, checkpoint_path: str | Path) -> None:
         payload = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint_mode = payload.get("mode")
+        if checkpoint_mode is not None and checkpoint_mode != self.ft_cfg.mode:
+            raise ValueError(
+                "FastMRI fine-tune resume mode mismatch: "
+                f"checkpoint mode '{checkpoint_mode}' != configured mode '{self.ft_cfg.mode}'"
+            )
         load_fastmri_finetune_checkpoint(
             self.model,
             payload,
@@ -397,6 +453,7 @@ class FastMRIFineTuneTrainer:
         if self.scheduler is not None and "scheduler_state_dict" in payload:
             self.scheduler.load_state_dict(payload["scheduler_state_dict"])
         self.current_epoch = int(payload.get("epoch", -1)) + 1
+        self._reconcile_mode_state_after_resume(payload)
 
     def _maybe_activate_adapters(self, epoch: int) -> None:
         if self.ft_cfg.mode != "warmup_then_both":
@@ -408,9 +465,17 @@ class FastMRIFineTuneTrainer:
 
         _set_adapter_trainable(self.model.base_model, True)
         self.mode_state["adapters_active"] = True
-        for group in self.optimizer.param_groups:
-            if group.get("name") == "adapter":
-                group["lr"] = float(self.ft_cfg.adapter_lr)
+        self._sync_optimizer_learning_rates()
+
+    def _base_model_has_trainable_parameters(self) -> bool:
+        return any(parameter.requires_grad for parameter in self.model.base_model.parameters())
+
+    def _should_checkpoint_frozen_base(self) -> bool:
+        return (
+            self.gradient_checkpoint_frozen_base
+            and self.model.training
+            and not self._base_model_has_trainable_parameters()
+        )
 
     def _log(self, payload: dict[str, Any], step: int | None = None) -> None:
         if self.wandb_run is not None:
@@ -448,6 +513,7 @@ class FastMRIFineTuneTrainer:
     def train_one_epoch(self, epoch: int) -> dict[str, float]:
         self._maybe_activate_adapters(epoch)
         self.model.train()
+        checkpoint_frozen_base = self._should_checkpoint_frozen_base()
 
         loss_sum = 0.0
         step_count = 0
@@ -459,7 +525,7 @@ class FastMRIFineTuneTrainer:
 
             self.optimizer.zero_grad(set_to_none=True)
             with self._autocast_context(enabled=self.use_bf16):
-                output = self.model(noisy)
+                output = self.model(noisy, checkpoint_base_model=checkpoint_frozen_base)
                 magnitude_output = complex_output_to_magnitude(output)
             magnitude_output = magnitude_output.float()
             loss = self.loss_fn(magnitude_output, clean)
@@ -505,7 +571,7 @@ class FastMRIFineTuneTrainer:
                 clean = clean.to(self.device, dtype=torch.float32, non_blocking=True)
 
                 with self._autocast_context(enabled=False):
-                    output = self.model(noisy)
+                    output = self.model(noisy, checkpoint_base_model=False)
                     magnitude_output = complex_output_to_magnitude(output)
                 magnitude_output = magnitude_output.float()
                 loss = self.loss_fn(magnitude_output, clean)
@@ -534,6 +600,7 @@ class FastMRIFineTuneTrainer:
             self.model,
             path,
             mode=self.ft_cfg.mode,
+            adapters_active=self.mode_state["adapters_active"],
             config=self.config,
             lora_config=self.config.get("lora"),
             epoch=epoch,

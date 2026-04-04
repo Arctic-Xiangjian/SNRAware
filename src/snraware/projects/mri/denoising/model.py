@@ -88,7 +88,11 @@ class DenoisingModel(torch.nn.Module):
         C = res_pre.shape[1]
 
         # establish the residual connection
-        res_backbone[:, :C, :, :, :] = res_pre + res_backbone[:, :C, :, :, :]
+        residual_head = res_pre + res_backbone[:, :C, :, :, :]
+        if C == res_backbone.shape[1]:
+            res_backbone = residual_head
+        else:
+            res_backbone = torch.cat([residual_head, res_backbone[:, C:, :, :, :]], dim=1)
 
         y_hat = self.post(res_backbone)
         return y_hat
