@@ -48,12 +48,17 @@ def seed_everything(seed: int) -> None:
 
 
 def complex_output_to_magnitude(output: torch.Tensor) -> torch.Tensor:
-    """Convert SNRAware 2-channel complex output to magnitude without epsilon."""
+    """Convert SNRAware 2-channel complex output to a 2D magnitude tensor."""
     if output.ndim != 5 or output.shape[1] != 2:
         raise ValueError(f"Expected [B, 2, T, H, W] output, got {tuple(output.shape)}")
     real = output[:, 0:1, ...]
     imag = output[:, 1:2, ...]
-    return torch.sqrt(real.square() + imag.square())
+    magnitude = torch.sqrt(real.square() + imag.square())
+    if magnitude.shape[2] != 1:
+        raise ValueError(
+            f"FastMRI fine-tuning expects singleton T=1, got magnitude shape {tuple(magnitude.shape)}"
+        )
+    return magnitude.squeeze(2)
 
 
 def _is_adapter_parameter(name: str) -> bool:
@@ -355,19 +360,24 @@ class FastMRIFineTuneTrainer:
         magnitude_target: torch.Tensor,
         metadata: dict[str, Any],
     ) -> tuple[list[str], list[int], list[np.ndarray], list[np.ndarray]]:
-        prediction = magnitude_prediction.detach().cpu().float().squeeze(1).squeeze(1).numpy()
-        target = magnitude_target.detach().cpu().float().squeeze(1).squeeze(1).numpy()
+        prediction = magnitude_prediction.detach().cpu().float()
+        target = magnitude_target.detach().cpu().float()
+        if prediction.ndim != 4 or target.ndim != 4:
+            raise ValueError(
+                "FastMRI evaluation expects [B, 1, H, W] magnitude tensors, "
+                f"got prediction {tuple(prediction.shape)} and target {tuple(target.shape)}"
+            )
 
-        mean = torch.as_tensor(metadata["mean"], dtype=torch.float32).reshape(-1, 1, 1).numpy()
-        std = torch.as_tensor(metadata["std"], dtype=torch.float32).reshape(-1, 1, 1).numpy()
+        mean = torch.as_tensor(metadata["mean"], dtype=torch.float32).reshape(-1, 1, 1, 1)
+        std = torch.as_tensor(metadata["std"], dtype=torch.float32).reshape(-1, 1, 1, 1)
 
-        prediction = prediction * std + mean
-        target = target * std + mean
+        prediction = (prediction * std + mean).squeeze(1)
+        target = (target * std + mean).squeeze(1)
 
         volume_names = [str(name) for name in metadata["volume_name"]]
         slice_indices = [int(idx) for idx in torch.as_tensor(metadata["slice_idx"]).tolist()]
-        prediction_list = [prediction[idx] for idx in range(prediction.shape[0])]
-        target_list = [target[idx] for idx in range(target.shape[0])]
+        prediction_list = [prediction[idx].numpy() for idx in range(prediction.shape[0])]
+        target_list = [target[idx].numpy() for idx in range(target.shape[0])]
         return volume_names, slice_indices, prediction_list, target_list
 
     def train_one_epoch(self, epoch: int) -> dict[str, float]:

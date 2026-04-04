@@ -106,7 +106,7 @@ def _complex_abs(x: torch.Tensor) -> torch.Tensor:
 
 
 class FastMRISNRAwareDataset(Dataset):
-    """A 2D FastMRI bridge dataset that returns SNRAware-compatible four-tuples."""
+    """A 2D FastMRI bridge dataset that returns pure 2D FastMRI fine-tune samples."""
 
     def __init__(
         self,
@@ -197,8 +197,8 @@ class FastMRISNRAwareDataset(Dataset):
         masked_kspace = masked_kspace.squeeze(0) / lq_running_std
         mask = mask.squeeze(0)
 
-        noisy = rearrange(under_recon_slice.squeeze(0), "h w c -> c 1 h w").contiguous()
-        clean = target_mag.unsqueeze(1).contiguous()
+        noisy = rearrange(under_recon_slice.squeeze(0), "h w c -> c h w").contiguous()
+        clean = target_mag.contiguous()
 
         metadata = {
             "name": f"{Path(volume_name).stem}_slice_{slice_idx}",
@@ -214,6 +214,16 @@ class FastMRISNRAwareDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
         raw_kspace, _mask, target, _attrs, file_name, slice_idx = self.slice_dataset[idx]
+        if target is None:
+            raise ValueError(
+                "FastMRI fine-tuning requires ground-truth reconstruction targets, "
+                f"but none were found for {file_name}, slice {slice_idx}."
+            )
+        if np.asarray(raw_kspace).ndim != 2:
+            raise ValueError(
+                "FastMRI fine-tuning bridge expects single-slice 2D k-space arrays, "
+                f"got shape {np.asarray(raw_kspace).shape} for {file_name}, slice {slice_idx}."
+            )
         return self._build_sample(
             raw_kspace=np.asarray(raw_kspace),
             target=np.asarray(target),

@@ -90,7 +90,7 @@ class ToyFastMRIDataset(Dataset):
     def __init__(self, num_samples: int, size: int = 16):
         super().__init__()
         generator = torch.Generator().manual_seed(42)
-        self.noisy = torch.randn(num_samples, 2, 1, size, size, generator=generator)
+        self.noisy = torch.randn(num_samples, 2, size, size, generator=generator)
         self.clean = torch.sqrt(
             self.noisy[:, 0:1, ...].square() + self.noisy[:, 1:2, ...].square()
         )
@@ -156,7 +156,7 @@ def test_wrapper_routes_2ch_input_through_gfactor_head():
     gfactor = DummyGFactor()
     model = SNRAwareWithGFactor(base_model=base_model, gfactor_unet=gfactor)
 
-    noisy = torch.randn(2, 2, 1, 8, 8)
+    noisy = torch.randn(2, 2, 8, 8)
     output = model(noisy)
 
     assert gfactor.calls == 1
@@ -184,7 +184,7 @@ def test_complex_output_to_magnitude_uses_exact_formula_without_epsilon():
     output[0, 0, 0, 0, 0] = 3.0
     output[0, 1, 0, 0, 0] = 4.0
     magnitude = complex_output_to_magnitude(output)
-    expected = torch.tensor([[[[[5.0, 0.0]]]]], dtype=torch.float32)
+    expected = torch.tensor([[[[5.0, 0.0]]]], dtype=torch.float32)
     assert torch.equal(magnitude, expected)
 
 
@@ -290,8 +290,8 @@ def test_fastmri_bridge_dataset_returns_expected_shapes_and_legacy_normalization
     )
     noisy, clean, noise_sigma, metadata = dataset[0]
 
-    assert noisy.shape == (2, 1, 320, 320)
-    assert clean.shape == (1, 1, 320, 320)
+    assert noisy.shape == (2, 320, 320)
+    assert clean.shape == (1, 320, 320)
     assert noisy.dtype == torch.float32
     assert clean.dtype == torch.float32
     assert noise_sigma.dtype == torch.float32
