@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -112,6 +112,7 @@ class FastMRISNRAwareDataset(Dataset):
         self,
         root: str | Path | list[str] | list[Path],
         *,
+        split: Literal["train", "val", "test"] = "train",
         challenge: str = "singlecoil",
         sample_rate: float | None = None,
         volume_sample_rate: float | None = None,
@@ -127,7 +128,10 @@ class FastMRISNRAwareDataset(Dataset):
         super().__init__()
         if challenge != "singlecoil":
             raise NotImplementedError("FastMRI fine-tuning bridge currently supports singlecoil only")
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"split must be one of 'train', 'val', or 'test', got {split!r}")
 
+        self.split = split
         self.acc_factor = int(acc_factor)
         self.crop_size = tuple(int(dim) for dim in crop_size)
         self.deterministic_mask_from_name = deterministic_mask_from_name
@@ -153,17 +157,15 @@ class FastMRISNRAwareDataset(Dataset):
         self,
         *,
         raw_kspace: np.ndarray,
-        target: np.ndarray,
         volume_name: str,
         slice_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
         orig_kspace_slice = torch.zeros((1, raw_kspace.shape[0], raw_kspace.shape[1], 2), dtype=torch.float32)
         orig_kspace_slice[0, :, :, 0] = torch.from_numpy(raw_kspace.real.astype(np.float32))
         orig_kspace_slice[0, :, :, 1] = torch.from_numpy(raw_kspace.imag.astype(np.float32))
+        original_kspace_shape = tuple(int(dim) for dim in orig_kspace_slice.shape[1:3])
 
-        orig_recon_slice = _ifft2c(orig_kspace_slice)
-        orig_recon_slice = _complex_center_crop(orig_recon_slice, self.crop_size)
-        orig_kspace_slice = _fft2c(orig_recon_slice)
+        clean_recon_slice = _ifft2c(orig_kspace_slice)
 
         center_fraction = 0.08 if self.acc_factor == 4 else 0.04
         mask_name = volume_name if self.deterministic_mask_from_name else None
@@ -181,11 +183,10 @@ class FastMRISNRAwareDataset(Dataset):
         masked_kspace = orig_kspace_slice * mask
         under_recon_slice = _ifft2c(masked_kspace)
         under_recon_slice = _complex_center_crop(under_recon_slice, self.crop_size)
+        clean_recon_slice = _complex_center_crop(clean_recon_slice, self.crop_size)
 
         under_recon_abs = _complex_abs(under_recon_slice).squeeze(0).unsqueeze(0)
-        target_mag = torch.from_numpy(np.asarray(target)).float().squeeze().unsqueeze(0)
-        if target_mag.shape[-2:] != self.crop_size:
-            target_mag = _center_crop_real(target_mag, self.crop_size)
+        clean_mag = _complex_abs(clean_recon_slice).squeeze(0).unsqueeze(0)
 
         lq_running_mean = torch.tensor(0.0, dtype=torch.float32)
         lq_running_std = under_recon_abs.mean().float()
@@ -193,12 +194,19 @@ class FastMRISNRAwareDataset(Dataset):
             raise ValueError(f"Encountered zero normalization scale for volume {volume_name}, slice {slice_idx}")
 
         under_recon_slice = under_recon_slice / lq_running_std
-        target_mag = target_mag / lq_running_std
-        masked_kspace = masked_kspace.squeeze(0) / lq_running_std
-        mask = mask.squeeze(0)
+        clean_mag = clean_mag / lq_running_std
 
         noisy = rearrange(under_recon_slice.squeeze(0), "h w c -> c h w").contiguous()
-        clean = target_mag.contiguous()
+        clean = clean_mag.contiguous()
+
+        cropped_output_shape = tuple(int(dim) for dim in clean.shape[-2:])
+        if cropped_output_shape != original_kspace_shape:
+            # Full-resolution mask and k-space are removed from metadata to prevent shape mismatch with the cropped 320x320 image outputs.
+            metadata_mask = None
+            metadata_masked_kspace = None
+        else:
+            metadata_mask = mask.squeeze(0).contiguous()
+            metadata_masked_kspace = (masked_kspace.squeeze(0) / lq_running_std).contiguous()
 
         metadata = {
             "name": f"{Path(volume_name).stem}_slice_{slice_idx}",
@@ -206,8 +214,8 @@ class FastMRISNRAwareDataset(Dataset):
             "slice_idx": int(slice_idx),
             "mean": lq_running_mean,
             "std": lq_running_std,
-            "mask": mask.contiguous(),
-            "masked_kspace": masked_kspace.contiguous(),
+            "mask": metadata_mask,
+            "masked_kspace": metadata_masked_kspace,
         }
         noise_sigma = torch.tensor(0.0, dtype=torch.float32)
         return noisy.float(), clean.float(), noise_sigma, metadata
@@ -226,7 +234,6 @@ class FastMRISNRAwareDataset(Dataset):
             )
         return self._build_sample(
             raw_kspace=np.asarray(raw_kspace),
-            target=np.asarray(target),
             volume_name=str(file_name),
             slice_idx=int(slice_idx),
         )

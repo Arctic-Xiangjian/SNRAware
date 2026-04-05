@@ -305,7 +305,7 @@ def run_pipeline(
     lora_alpha: float,
     lora_dropout: float,
 ) -> dict[str, Any]:
-    model = DenoisingModel(cfg, D=depth, H=64, W=64)
+    model = DenoisingModel(cfg, D=depth, H=128, W=128)
     matched_keys, total_keys = load_pretrained_weights(model, weight_path)
 
     if is_lora:
@@ -397,7 +397,7 @@ def run_modality(
     print(f"\n{'=' * 28} Executing {mode} Data Pipeline (D={depth}) {'=' * 28}")
 
     dataset = DummyMRIDataset(
-        num_samples=num_samples, depth=depth, height=64, width=64, seed=seed + depth
+        num_samples=num_samples, depth=depth, height=128, width=128, seed=seed + depth
     )
     dataloader = DataLoader(
         dataset,

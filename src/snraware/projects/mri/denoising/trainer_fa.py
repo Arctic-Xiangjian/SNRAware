@@ -352,6 +352,7 @@ def build_fastmri_dataloaders(
     def _build_dataset(
         root: str | Path | None,
         *,
+        split: str,
         sample_rate: Any | None,
         volume_sample_rate: Any | None,
     ):
@@ -359,6 +360,7 @@ def build_fastmri_dataloaders(
             return None
         return FastMRISNRAwareDataset(
             root=root,
+            split=split,
             challenge=ft_cfg.challenge,
             sample_rate=sample_rate,
             volume_sample_rate=volume_sample_rate,
@@ -375,6 +377,7 @@ def build_fastmri_dataloaders(
     train_sample_rate, train_volume_sample_rate = _resolve_train_sampling()
     train_dataset = _build_dataset(
         ft_cfg.train_root,
+        split="train",
         sample_rate=train_sample_rate,
         volume_sample_rate=train_volume_sample_rate,
     )
@@ -382,8 +385,8 @@ def build_fastmri_dataloaders(
         raise ValueError("fastmri_finetune.train_root must be provided")
 
     # Validation and test always use the full dataset by default.
-    val_dataset = _build_dataset(ft_cfg.val_root, sample_rate=None, volume_sample_rate=None)
-    test_dataset = _build_dataset(ft_cfg.test_root, sample_rate=None, volume_sample_rate=None)
+    val_dataset = _build_dataset(ft_cfg.val_root, split="val", sample_rate=None, volume_sample_rate=None)
+    test_dataset = _build_dataset(ft_cfg.test_root, split="test", sample_rate=None, volume_sample_rate=None)
 
     loader_kwargs = {
         "batch_size": int(ft_cfg.batch_size),

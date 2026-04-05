@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 pytest.importorskip("hydra")
 from hydra import compose, initialize
 
+import fastmri_data.work_with_snraware as fastmri_dataset_module
 from fastmri_data.work_with_snraware import FastMRISNRAwareDataset
 from snraware.projects.mri.denoising.base_model_resolver import (
     DEFAULT_BASE_MODEL_VARIANT,
@@ -135,8 +136,7 @@ def _build_wrapped_model(mode: str) -> SNRAwareWithGFactor:
     return SNRAwareWithGFactor(base_model=base_model)
 
 
-def _write_fake_fastmri_volume(path: Path) -> None:
-    size = 320
+def _write_fake_fastmri_volume(path: Path, *, size: int = 320) -> None:
     image = torch.zeros(2, size, size, dtype=torch.complex64)
     image[0, size // 2, size // 2] = 1 + 2j
     image[1, size // 2 - 5, size // 2 + 3] = 2 - 1j
@@ -541,13 +541,15 @@ def test_fastmri_checkpoint_loader_accepts_legacy_pre_post_adapter_state(tmp_pat
             assert torch.equal(parameter, source_model.base_model.state_dict()[name])
 
 
-def test_fastmri_bridge_dataset_returns_expected_shapes_and_legacy_normalization(tmp_path: Path):
+def test_fastmri_bridge_dataset_returns_expected_shapes_and_uses_full_resolution_masking(tmp_path: Path):
     data_dir = tmp_path / "singlecoil_train"
     data_dir.mkdir()
-    _write_fake_fastmri_volume(data_dir / "case001.h5")
+    volume_path = data_dir / "case001.h5"
+    _write_fake_fastmri_volume(volume_path, size=384)
 
     dataset = FastMRISNRAwareDataset(
         root=data_dir,
+        split="train",
         acc_factor=4,
         deterministic_mask_from_name=True,
         use_dataset_cache=False,
@@ -560,10 +562,68 @@ def test_fastmri_bridge_dataset_returns_expected_shapes_and_legacy_normalization
     assert clean.dtype == torch.float32
     assert noise_sigma.dtype == torch.float32
     assert {"name", "volume_name", "slice_idx", "mean", "std", "mask", "masked_kspace"} <= set(metadata)
+    assert metadata["mask"] is None
+    assert metadata["masked_kspace"] is None
 
     noisy_mag = torch.sqrt(noisy[0:1].square() + noisy[1:2].square())
     assert torch.allclose(noisy_mag.mean(), torch.tensor(1.0), atol=1e-4)
     assert metadata["mean"].item() == 0.0
+
+    with h5py.File(volume_path, "r") as hf:
+        raw_kspace = np.asarray(hf["kspace"][0])
+
+    orig_kspace_slice = torch.zeros((1, raw_kspace.shape[0], raw_kspace.shape[1], 2), dtype=torch.float32)
+    orig_kspace_slice[0, :, :, 0] = torch.from_numpy(raw_kspace.real.astype(np.float32))
+    orig_kspace_slice[0, :, :, 1] = torch.from_numpy(raw_kspace.imag.astype(np.float32))
+    clean_recon_slice = fastmri_dataset_module._ifft2c(orig_kspace_slice)
+
+    mask = fastmri_dataset_module.legacy_uniform1d_mask(
+        img=orig_kspace_slice.permute(0, 3, 1, 2),
+        size=orig_kspace_slice.shape[2],
+        batch_size=1,
+        acc_factor=4,
+        center_fraction=0.08,
+        fix=False,
+        name="case001.h5",
+    ).permute(0, 2, 3, 1)
+    masked_kspace = orig_kspace_slice * mask
+    under_recon_slice = fastmri_dataset_module._ifft2c(masked_kspace)
+
+    clean_recon_slice = fastmri_dataset_module._complex_center_crop(clean_recon_slice, (320, 320))
+    under_recon_slice = fastmri_dataset_module._complex_center_crop(under_recon_slice, (320, 320))
+
+    under_recon_abs = fastmri_dataset_module._complex_abs(under_recon_slice).squeeze(0).unsqueeze(0)
+    expected_std = under_recon_abs.mean().float()
+    expected_noisy = (under_recon_slice / expected_std).squeeze(0).permute(2, 0, 1).contiguous()
+    expected_clean = (
+        fastmri_dataset_module._complex_abs(clean_recon_slice).squeeze(0).unsqueeze(0) / expected_std
+    ).contiguous()
+
+    assert torch.allclose(noisy, expected_noisy, atol=1e-5)
+    assert torch.allclose(clean, expected_clean, atol=1e-5)
+
+
+def test_fastmri_bridge_dataset_keeps_mask_metadata_when_no_crop(tmp_path: Path):
+    data_dir = tmp_path / "singlecoil_val"
+    data_dir.mkdir()
+    _write_fake_fastmri_volume(data_dir / "case001.h5", size=320)
+
+    dataset = FastMRISNRAwareDataset(
+        root=data_dir,
+        split="val",
+        acc_factor=4,
+        deterministic_mask_from_name=True,
+        use_dataset_cache=False,
+    )
+    noisy, clean, _noise_sigma, metadata = dataset[0]
+
+    assert dataset.split == "val"
+    assert noisy.shape == (2, 320, 320)
+    assert clean.shape == (1, 320, 320)
+    assert metadata["mask"] is not None
+    assert metadata["masked_kspace"] is not None
+    assert metadata["mask"].shape == (320, 320, 2)
+    assert metadata["masked_kspace"].shape == (320, 320, 2)
 
     center_fraction = 0.08
     nsamp_center = int(round(320 * center_fraction))
@@ -615,6 +675,9 @@ def test_build_fastmri_dataloaders_applies_sample_rate_to_train_only(monkeypatch
     build_fastmri_dataloaders(config)
 
     assert len(created) == 3
+    assert created[0]["split"] == "train"
+    assert created[1]["split"] == "val"
+    assert created[2]["split"] == "test"
     assert created[0]["sample_rate"] == 0.02
     assert created[0]["volume_sample_rate"] == 0.5
     assert created[1]["sample_rate"] is None
