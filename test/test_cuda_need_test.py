@@ -384,7 +384,7 @@ def test_cuda_profiler_warmup_then_both_records_phases_and_toggles_checkpoint(mo
         cuda_need_test_module,
         "should_checkpoint_frozen_base",
         lambda model, *, gradient_checkpoint_frozen_base: checkpoint_queries.append(bool(model.base_model.weight.requires_grad))
-        or (gradient_checkpoint_frozen_base and not model.base_model.weight.requires_grad),
+        or gradient_checkpoint_frozen_base,
     )
     monkeypatch.setattr(cuda_need_test_module, "_cuda_memory_snapshot", lambda device: with_gb(next(snapshot_values)))
 
@@ -411,7 +411,7 @@ def test_cuda_profiler_warmup_then_both_records_phases_and_toggles_checkpoint(mo
     assert report["mode"] == "fastmri_wrapped_cuda_train_peak"
     assert set(report["cases"]) == {"warmup", "after_warmup"}
     assert report["cases"]["warmup"]["checkpoint_base_model"] is True
-    assert report["cases"]["after_warmup"]["checkpoint_base_model"] is False
+    assert report["cases"]["after_warmup"]["checkpoint_base_model"] is True
     assert report["cases"]["warmup"]["headline"]["peak_reserved_bytes"] == 120
     assert report["cases"]["after_warmup"]["headline"]["peak_reserved_bytes"] == 122
     assert list(report["cases"]["warmup"]["snapshots"]) == [
@@ -429,7 +429,7 @@ def test_cuda_profiler_warmup_then_both_records_phases_and_toggles_checkpoint(mo
         {"mode": "warmup_then_both", "adapters_active": True, "has_lora": True},
     ]
     assert built_models[0].forward_checkpoint_flags == [True]
-    assert built_models[1].forward_checkpoint_flags == [False]
+    assert built_models[1].forward_checkpoint_flags == [True]
 
 
 

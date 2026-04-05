@@ -94,8 +94,12 @@ def fastmri_autocast_context(device: torch.device, *, enabled: bool):
     return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=enabled)
 
 
-def _is_adapter_parameter(name: str) -> bool:
-    return ".lora_A." in name or ".lora_B." in name or name.startswith("pre.") or name.startswith("post.")
+def _is_lora_parameter(name: str) -> bool:
+    return ".lora_A." in name or ".lora_B." in name
+
+
+def _is_pre_post_parameter(name: str) -> bool:
+    return name.startswith("pre.") or name.startswith("post.")
 
 
 def _set_module_trainable(module: nn.Module, flag: bool) -> None:
@@ -103,14 +107,39 @@ def _set_module_trainable(module: nn.Module, flag: bool) -> None:
         parameter.requires_grad = flag
 
 
-def _set_adapter_trainable(base_model: nn.Module, flag: bool) -> None:
+def _set_lora_trainable(base_model: nn.Module, flag: bool) -> None:
     for name, parameter in base_model.named_parameters():
-        if _is_adapter_parameter(name):
+        if _is_lora_parameter(name):
             parameter.requires_grad = flag
 
 
-def _get_adapter_parameters(base_model: nn.Module) -> list[nn.Parameter]:
-    return [parameter for name, parameter in base_model.named_parameters() if _is_adapter_parameter(name)]
+def _set_pre_post_trainable(base_model: nn.Module, flag: bool) -> None:
+    for name, parameter in base_model.named_parameters():
+        if _is_pre_post_parameter(name):
+            parameter.requires_grad = flag
+
+
+def _get_fastmri_adapter_parameters(base_model: nn.Module, *, train_pre_post: bool) -> list[nn.Parameter]:
+    return [
+        parameter
+        for name, parameter in base_model.named_parameters()
+        if _is_lora_parameter(name) or (train_pre_post and _is_pre_post_parameter(name))
+    ]
+
+
+def _configure_fastmri_base_model_trainable_state(
+    base_model: nn.Module,
+    *,
+    train_lora: bool,
+    train_pre_post: bool,
+) -> None:
+    _set_module_trainable(base_model, False)
+    _set_lora_trainable(base_model, train_lora)
+    _set_pre_post_trainable(base_model, train_pre_post)
+
+
+def _resolve_train_pre_post(ft_cfg: Any) -> bool:
+    return bool(ft_cfg.get("train_pre_post", False))
 
 
 def build_fastmri_optimizer(
@@ -121,7 +150,10 @@ def build_fastmri_optimizer(
     """Build the FastMRI AdamW optimizer with trainer-matching parameter groups."""
     param_groups = []
     gfactor_params = list(model.gfactor_unet.parameters())
-    adapter_params = _get_adapter_parameters(model.base_model)
+    adapter_params = _get_fastmri_adapter_parameters(
+        model.base_model,
+        train_pre_post=_resolve_train_pre_post(ft_cfg),
+    )
 
     if any(parameter.requires_grad for parameter in gfactor_params) or ft_cfg.mode == "warmup_then_both":
         param_groups.append(
@@ -157,12 +189,8 @@ def should_checkpoint_frozen_base(
     *,
     gradient_checkpoint_frozen_base: bool,
 ) -> bool:
-    """Mirror the trainer policy for checkpointing a fully frozen SNRAware base model."""
-    return (
-        gradient_checkpoint_frozen_base
-        and model.training
-        and not any(parameter.requires_grad for parameter in model.base_model.parameters())
-    )
+    """Checkpoint the SNRAware base-model segment during training whenever enabled."""
+    return gradient_checkpoint_frozen_base and model.training
 
 
 def configure_model_for_finetune_mode(
@@ -171,6 +199,7 @@ def configure_model_for_finetune_mode(
     mode: str,
     lora_config: Any | None = None,
     adapters_active: bool | None = None,
+    train_pre_post: bool = False,
 ) -> dict[str, Any]:
     """Configure trainable parameters for the requested FastMRI fine-tune mode."""
     supported_modes = {"unet_only", "unet_and_lora", "lora_only", "warmup_then_both"}
@@ -192,28 +221,44 @@ def configure_model_for_finetune_mode(
 
         if not has_lora_adapters(model.base_model):
             apply_lora_to_model(model.base_model, lora_config=lora_config)
-        else:
-            _set_module_trainable(model.base_model, False)
+        _configure_fastmri_base_model_trainable_state(
+            model.base_model,
+            train_lora=False,
+            train_pre_post=False,
+        )
 
         if mode == "unet_and_lora":
             _set_module_trainable(model.gfactor_unet, True)
-            _set_adapter_trainable(model.base_model, True)
+            _configure_fastmri_base_model_trainable_state(
+                model.base_model,
+                train_lora=True,
+                train_pre_post=bool(train_pre_post),
+            )
             adapters_active = True
         elif mode == "lora_only":
             _set_module_trainable(model.gfactor_unet, False)
-            _set_adapter_trainable(model.base_model, True)
+            _configure_fastmri_base_model_trainable_state(
+                model.base_model,
+                train_lora=True,
+                train_pre_post=bool(train_pre_post),
+            )
             adapters_active = True
         else:
             _set_module_trainable(model.gfactor_unet, True)
             adapters_active = (
                 bool(requested_adapters_active) if requested_adapters_active is not None else False
             )
-            _set_adapter_trainable(model.base_model, adapters_active)
+            _configure_fastmri_base_model_trainable_state(
+                model.base_model,
+                train_lora=adapters_active,
+                train_pre_post=bool(train_pre_post) and adapters_active,
+            )
 
     return {
         "mode": mode,
         "adapters_active": adapters_active,
         "has_lora": has_lora_adapters(model.base_model),
+        "train_pre_post": bool(train_pre_post),
     }
 
 
@@ -399,6 +444,7 @@ class FastMRIFineTuneTrainer:
             self.model,
             mode=self.ft_cfg.mode,
             lora_config=config.get("lora"),
+            train_pre_post=_resolve_train_pre_post(self.ft_cfg),
         )
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
@@ -453,6 +499,7 @@ class FastMRIFineTuneTrainer:
             mode=self.ft_cfg.mode,
             lora_config=self.config.get("lora"),
             adapters_active=adapters_active,
+            train_pre_post=_resolve_train_pre_post(self.ft_cfg),
         )
         self._sync_optimizer_learning_rates()
 
@@ -485,12 +532,13 @@ class FastMRIFineTuneTrainer:
         if epoch < int(self.ft_cfg.warmup_epochs):
             return
 
-        _set_adapter_trainable(self.model.base_model, True)
+        _configure_fastmri_base_model_trainable_state(
+            self.model.base_model,
+            train_lora=True,
+            train_pre_post=_resolve_train_pre_post(self.ft_cfg),
+        )
         self.mode_state["adapters_active"] = True
         self._sync_optimizer_learning_rates()
-
-    def _base_model_has_trainable_parameters(self) -> bool:
-        return any(parameter.requires_grad for parameter in self.model.base_model.parameters())
 
     def _should_checkpoint_frozen_base(self) -> bool:
         return should_checkpoint_frozen_base(

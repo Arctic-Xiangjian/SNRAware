@@ -76,6 +76,7 @@ def _tiny_config(mode: str):
             "evaluate_every_n_epochs": 1,
             "use_bf16": False,
             "gradient_checkpoint_frozen_base": True,
+            "train_pre_post": False,
         }
     )
     return cfg
@@ -163,10 +164,6 @@ def _write_fake_fastmri_volume(path: Path) -> None:
         hf.create_dataset("ismrmrd_header", data=np.bytes_(header))
 
 
-def _clean_lora_wrapped_name(name: str) -> str:
-    return name.replace(".base_layer", "")
-
-
 class CaptureL1Loss(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -183,9 +180,20 @@ def _adapter_trainable_names(model: SNRAwareWithGFactor) -> list[str]:
     return [
         name
         for name, parameter in model.base_model.named_parameters()
-        if (".lora_" in name or name.startswith("pre.") or name.startswith("post."))
-        and parameter.requires_grad
+        if ".lora_" in name and parameter.requires_grad
     ]
+
+
+def _pre_post_trainable_names(model: SNRAwareWithGFactor) -> list[str]:
+    return [
+        name
+        for name, parameter in model.base_model.named_parameters()
+        if (name.startswith("pre.") or name.startswith("post.")) and parameter.requires_grad
+    ]
+
+
+def _clean_lora_wrapped_name(name: str) -> str:
+    return name.replace(".base_layer", "")
 
 
 def _backbone_trainable_names(model: SNRAwareWithGFactor) -> list[str]:
@@ -291,24 +299,31 @@ def test_fastmri_autocast_context_uses_cuda_bf16(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("mode", "expect_unet_trainable", "expect_adapter_trainable"),
+    ("mode", "expect_unet_trainable", "expect_adapter_trainable", "expect_pre_post_trainable"),
     [
-        ("unet_only", True, False),
-        ("unet_and_lora", True, True),
-        ("lora_only", False, True),
-        ("warmup_then_both", True, False),
+        ("unet_only", True, False, False),
+        ("unet_and_lora", True, True, False),
+        ("lora_only", False, True, False),
+        ("warmup_then_both", True, False, False),
     ],
 )
-def test_configure_model_for_modes(mode: str, expect_unet_trainable: bool, expect_adapter_trainable: bool):
+def test_configure_model_for_modes(
+    mode: str,
+    expect_unet_trainable: bool,
+    expect_adapter_trainable: bool,
+    expect_pre_post_trainable: bool,
+):
     model = _build_wrapped_model(mode)
-    state = configure_model_for_finetune_mode(model, mode=mode, lora_config=model.base_model.config.lora)
+    state = configure_model_for_finetune_mode(
+        model,
+        mode=mode,
+        lora_config=model.base_model.config.lora,
+        train_pre_post=False,
+    )
 
     unet_trainable = any(parameter.requires_grad for parameter in model.gfactor_unet.parameters())
-    adapter_trainable = any(
-        parameter.requires_grad
-        for name, parameter in model.base_model.named_parameters()
-        if ".lora_" in name or name.startswith("pre.") or name.startswith("post.")
-    )
+    adapter_trainable = bool(_adapter_trainable_names(model))
+    pre_post_trainable = bool(_pre_post_trainable_names(model))
     frozen_backbone = all(
         not parameter.requires_grad
         for name, parameter in model.base_model.named_parameters()
@@ -317,8 +332,26 @@ def test_configure_model_for_modes(mode: str, expect_unet_trainable: bool, expec
 
     assert unet_trainable is expect_unet_trainable
     assert adapter_trainable is expect_adapter_trainable
+    assert pre_post_trainable is expect_pre_post_trainable
     assert frozen_backbone
     assert state["mode"] == mode
+    assert state["train_pre_post"] is False
+
+
+@pytest.mark.parametrize("mode", ["unet_and_lora", "lora_only", "warmup_then_both"])
+def test_configure_model_for_modes_can_enable_pre_post(mode: str):
+    model = _build_wrapped_model(mode)
+    state = configure_model_for_finetune_mode(
+        model,
+        mode=mode,
+        lora_config=model.base_model.config.lora,
+        adapters_active=(mode != "warmup_then_both"),
+        train_pre_post=True,
+    )
+
+    expect_pre_post_trainable = mode != "warmup_then_both" or state["adapters_active"]
+    assert bool(_pre_post_trainable_names(model)) is expect_pre_post_trainable
+    assert state["train_pre_post"] is True
 
 
 def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path):
@@ -328,6 +361,7 @@ def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path)
         model,
         mode="unet_and_lora",
         lora_config=model.base_model.config.lora,
+        train_pre_post=False,
     )
 
     with torch.no_grad():
@@ -336,7 +370,7 @@ def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path)
         first_adapter_param = next(
             parameter
             for name, parameter in model.base_model.named_parameters()
-            if ".lora_" in name or name.startswith("pre.") or name.startswith("post.")
+            if ".lora_" in name
         )
         first_adapter_param.add_(0.25)
 
@@ -355,10 +389,10 @@ def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path)
     assert is_fastmri_finetune_checkpoint(payload)
 
     fresh_model = _build_wrapped_model("unet_and_lora")
-    backbone_snapshot = {
+    frozen_snapshot = {
         _clean_lora_wrapped_name(name): parameter.detach().clone()
         for name, parameter in fresh_model.base_model.named_parameters()
-        if ".lora_" not in name and not name.startswith("pre.") and not name.startswith("post.")
+        if ".lora_" not in name
     }
 
     missing, unexpected = load_fastmri_finetune_checkpoint(
@@ -373,10 +407,10 @@ def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path)
     for key, value in model.gfactor_unet.state_dict().items():
         assert torch.equal(value, fresh_model.gfactor_unet.state_dict()[key])
     for name, parameter in fresh_model.base_model.named_parameters():
-        if ".lora_" in name or name.startswith("pre.") or name.startswith("post."):
+        if ".lora_" in name:
             assert torch.equal(parameter, model.base_model.state_dict()[name])
         else:
-            assert torch.equal(parameter, backbone_snapshot[_clean_lora_wrapped_name(name)])
+            assert torch.equal(parameter, frozen_snapshot[_clean_lora_wrapped_name(name)])
 
 
 def test_fastmri_checkpoint_payload_records_adapters_active(tmp_path: Path):
@@ -386,6 +420,7 @@ def test_fastmri_checkpoint_payload_records_adapters_active(tmp_path: Path):
         mode="warmup_then_both",
         lora_config=model.base_model.config.lora,
         adapters_active=False,
+        train_pre_post=False,
     )
 
     checkpoint_path = tmp_path / "warmup_state.pth"
@@ -401,6 +436,8 @@ def test_fastmri_checkpoint_payload_records_adapters_active(tmp_path: Path):
 
     payload = torch.load(checkpoint_path, map_location="cpu")
     assert payload["adapters_active"] is False
+    assert payload["train_pre_post"] is False
+    assert all(".lora_" in key for key in payload["lora_adapter"])
 
 
 def test_fastmri_checkpoint_loader_skips_duplicate_lora_injection(tmp_path: Path):
@@ -410,6 +447,7 @@ def test_fastmri_checkpoint_loader_skips_duplicate_lora_injection(tmp_path: Path
         model,
         mode="unet_and_lora",
         lora_config=model.base_model.config.lora,
+        train_pre_post=False,
     )
 
     checkpoint_path = tmp_path / "already_adapted.pth"
@@ -429,6 +467,7 @@ def test_fastmri_checkpoint_loader_skips_duplicate_lora_injection(tmp_path: Path
         fresh_model,
         mode="unet_and_lora",
         lora_config=fresh_model.base_model.config.lora,
+        train_pre_post=False,
     )
 
     def fail_if_called(*args, **kwargs):
@@ -443,6 +482,63 @@ def test_fastmri_checkpoint_loader_skips_duplicate_lora_injection(tmp_path: Path
 
     assert missing == []
     assert unexpected == []
+
+
+def test_fastmri_checkpoint_loader_accepts_legacy_pre_post_adapter_state(tmp_path: Path):
+    torch.manual_seed(11)
+    source_model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        source_model,
+        mode="unet_and_lora",
+        lora_config=source_model.base_model.config.lora,
+        train_pre_post=True,
+    )
+
+    with torch.no_grad():
+        first_pre_post = next(
+            parameter
+            for name, parameter in source_model.base_model.named_parameters()
+            if name.startswith("pre.") or name.startswith("post.")
+        )
+        first_pre_post.add_(0.75)
+
+    checkpoint_path = tmp_path / "legacy_pre_post.pth"
+    save_fastmri_finetune_checkpoint(
+        source_model,
+        checkpoint_path,
+        mode="unet_and_lora",
+        adapters_active=True,
+        config=OmegaConf.create(
+            {
+                "fastmri_finetune": {"train_pre_post": True},
+            }
+        ),
+        lora_config=source_model.base_model.config.lora,
+        epoch=0,
+    )
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    assert any(key.startswith("pre.") or key.startswith("post.") for key in payload["lora_adapter"])
+
+    fresh_model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        fresh_model,
+        mode="unet_and_lora",
+        lora_config=fresh_model.base_model.config.lora,
+        train_pre_post=False,
+    )
+
+    missing, unexpected = load_fastmri_finetune_checkpoint(
+        fresh_model,
+        payload,
+        apply_lora_fn=apply_lora_to_model,
+        lora_config=fresh_model.base_model.config.lora,
+    )
+
+    assert missing == []
+    assert unexpected == []
+    for name, parameter in fresh_model.base_model.named_parameters():
+        if name.startswith("pre.") or name.startswith("post."):
+            assert torch.equal(parameter, source_model.base_model.state_dict()[name])
 
 
 def test_fastmri_bridge_dataset_returns_expected_shapes_and_legacy_normalization(tmp_path: Path):
@@ -593,6 +689,7 @@ def test_fastmri_config_defaults_to_small_base_model():
     assert config.base_model.variant == "small"
     assert config.base_model.config_path is None
     assert config.base_model.checkpoint_path is None
+    assert config.fastmri_finetune.train_pre_post is False
 
 
 def test_run_fastmri_launcher_exposes_use_bf16():
@@ -690,6 +787,7 @@ def test_resume_reconciles_mode_trainable_state(
 
     assert _gfactor_is_trainable(resumed_trainer.model) is expect_gfactor_trainable
     assert bool(_adapter_trainable_names(resumed_trainer.model)) is expect_adapter_trainable
+    assert _pre_post_trainable_names(resumed_trainer.model) == []
     assert _backbone_trainable_names(resumed_trainer.model) == []
 
 
@@ -724,6 +822,7 @@ def test_resume_reconciles_warmup_then_both_before_activation(tmp_path: Path):
     assert resumed_trainer.mode_state["adapters_active"] is False
     assert _gfactor_is_trainable(resumed_trainer.model) is True
     assert _adapter_trainable_names(resumed_trainer.model) == []
+    assert _pre_post_trainable_names(resumed_trainer.model) == []
     assert _backbone_trainable_names(resumed_trainer.model) == []
     assert _adapter_group_lr(resumed_trainer) == 0.0
 
@@ -760,6 +859,7 @@ def test_resume_reconciles_warmup_then_both_after_activation(tmp_path: Path):
     assert resumed_trainer.mode_state["adapters_active"] is True
     assert _gfactor_is_trainable(resumed_trainer.model) is True
     assert bool(_adapter_trainable_names(resumed_trainer.model)) is True
+    assert _pre_post_trainable_names(resumed_trainer.model) == []
     assert _backbone_trainable_names(resumed_trainer.model) == []
     assert _adapter_group_lr(resumed_trainer) == pytest.approx(float(config.fastmri_finetune.adapter_lr))
 
@@ -797,13 +897,13 @@ def test_resume_rejects_mode_mismatch(tmp_path: Path):
     ("mode", "epoch", "expect_checkpoint"),
     [
         ("unet_only", 0, True),
-        ("unet_and_lora", 0, False),
-        ("lora_only", 0, False),
+        ("unet_and_lora", 0, True),
+        ("lora_only", 0, True),
         ("warmup_then_both", 0, True),
-        ("warmup_then_both", 1, False),
+        ("warmup_then_both", 1, True),
     ],
 )
-def test_train_gradient_checkpointing_only_runs_for_frozen_base(
+def test_train_gradient_checkpointing_runs_whenever_enabled_during_training(
     mode: str,
     epoch: int,
     expect_checkpoint: bool,
@@ -869,6 +969,22 @@ def test_eval_never_uses_gradient_checkpointing(monkeypatch, tmp_path: Path):
     assert checkpoint_calls == []
 
 
+def test_should_checkpoint_frozen_base_stays_enabled_with_active_lora():
+    model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        model,
+        mode="unet_and_lora",
+        lora_config=model.base_model.config.lora,
+        train_pre_post=False,
+    )
+
+    model.train()
+    assert trainer_fa_module.should_checkpoint_frozen_base(
+        model,
+        gradient_checkpoint_frozen_base=True,
+    ) is True
+
+
 def test_gradient_checkpointing_keeps_gfactor_gradients():
     model = _build_wrapped_model("unet_only")
     configure_model_for_finetune_mode(model, mode="unet_only", lora_config=model.base_model.config.lora)
@@ -879,6 +995,28 @@ def test_gradient_checkpointing_keeps_gfactor_gradients():
     loss.backward()
 
     assert any(parameter.grad is not None for parameter in model.gfactor_unet.parameters())
+
+
+def test_gradient_checkpointing_keeps_lora_gradients_when_adapters_active():
+    model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        model,
+        mode="unet_and_lora",
+        lora_config=model.base_model.config.lora,
+        train_pre_post=False,
+    )
+
+    noisy = torch.randn(1, 2, 32, 32, dtype=torch.float32)
+    output = model(noisy, checkpoint_base_model=True)
+    loss = complex_output_to_magnitude(output).sum()
+    loss.backward()
+
+    assert any(parameter.grad is not None for parameter in model.gfactor_unet.parameters())
+    assert any(
+        parameter.grad is not None
+        for name, parameter in model.base_model.named_parameters()
+        if ".lora_" in name
+    )
 
 
 def test_denoising_model_forward_backward_smoke():
@@ -917,6 +1055,61 @@ def test_warmup_activation_updates_scheduler_base_lrs(tmp_path: Path):
 
     assert _adapter_group_lr(trainer) == pytest.approx(float(config.fastmri_finetune.adapter_lr))
     assert trainer.scheduler.base_lrs[1] == pytest.approx(float(config.fastmri_finetune.adapter_lr))
+
+
+def test_fastmri_optimizer_honors_train_pre_post_boundary(tmp_path: Path):
+    config = _tiny_config("unet_and_lora")
+    config.fastmri_finetune.train_pre_post = False
+    train_loader = DataLoader(ToyFastMRIDataset(1), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_and_lora"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "optimizer_boundary",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    adapter_param_ids = {
+        id(parameter)
+        for group in trainer.optimizer.param_groups
+        if group.get("name") == "adapter"
+        for parameter in group["params"]
+    }
+    pre_post_param_ids = {
+        id(parameter)
+        for name, parameter in trainer.model.base_model.named_parameters()
+        if name.startswith("pre.") or name.startswith("post.")
+    }
+
+    assert adapter_param_ids
+    assert adapter_param_ids.isdisjoint(pre_post_param_ids)
+
+    config.fastmri_finetune.train_pre_post = True
+    trainer_with_pre_post = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_and_lora"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "optimizer_boundary_with_pre_post",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    adapter_param_ids_with_pre_post = {
+        id(parameter)
+        for group in trainer_with_pre_post.optimizer.param_groups
+        if group.get("name") == "adapter"
+        for parameter in group["params"]
+    }
+    pre_post_param_ids_with_pre_post = {
+        id(parameter)
+        for name, parameter in trainer_with_pre_post.model.base_model.named_parameters()
+        if name.startswith("pre.") or name.startswith("post.")
+    }
+
+    assert pre_post_param_ids_with_pre_post <= adapter_param_ids_with_pre_post
 
 
 @pytest.mark.parametrize("mode", ["unet_only", "unet_and_lora"])
@@ -998,6 +1191,44 @@ def test_fastmri_trainer_train_uses_bf16_context_but_loss_stays_fp32(monkeypatch
     assert autocast_calls == [True, True]
     assert capture_loss.pred_dtype == torch.float32
     assert capture_loss.target_dtype == torch.float32
+
+
+def test_fastmri_trainer_joint_bf16_path_keeps_checkpointing_enabled(monkeypatch, tmp_path: Path):
+    config = _tiny_config("unet_and_lora")
+    config.fastmri_finetune.max_epochs = 1
+    config.fastmri_finetune.use_bf16 = True
+
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_and_lora"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "bf16_joint_train",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+        precision_state={"mode": "bf16", "use_bf16": True},
+    )
+
+    autocast_calls = []
+    checkpoint_calls = []
+
+    @contextmanager
+    def fake_context(*, enabled: bool):
+        autocast_calls.append(enabled)
+        yield
+
+    def fake_checkpoint(function, *args, **kwargs):
+        checkpoint_calls.append(kwargs)
+        return function(*args)
+
+    monkeypatch.setattr(trainer, "_autocast_context", lambda *, enabled: fake_context(enabled=enabled))
+    monkeypatch.setattr(fastmri_compat_module.checkpoint_utils, "checkpoint", fake_checkpoint)
+
+    trainer.train_one_epoch(0)
+
+    assert autocast_calls == [True, True]
+    assert checkpoint_calls == [{"use_reentrant": False}, {"use_reentrant": False}]
 
 
 def test_fastmri_trainer_eval_disables_bf16_and_keeps_metric_arrays_fp32(monkeypatch, tmp_path: Path):

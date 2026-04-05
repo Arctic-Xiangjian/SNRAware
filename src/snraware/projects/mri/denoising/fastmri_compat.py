@@ -15,7 +15,6 @@ import torch.utils.checkpoint as checkpoint_utils
 from omegaconf import DictConfig, OmegaConf
 
 from snraware.projects.mri.denoising.lora_utils import (
-    extract_lora_state_dict,
     is_lora_checkpoint,
     resolve_lora_config,
 )
@@ -415,11 +414,34 @@ def has_lora_adapters(model: nn.Module) -> bool:
     return any(".lora_A." in name or ".lora_B." in name for name, _ in model.named_parameters())
 
 
-def extract_fastmri_adapter_state(model: SNRAwareWithGFactor) -> dict[str, torch.Tensor]:
-    """Extract LoRA + pre/post state only when LoRA is present."""
+def _resolve_fastmri_train_pre_post(config: Any | None) -> bool:
+    if config is None:
+        return False
+    if isinstance(config, DictConfig):
+        value = OmegaConf.select(config, "fastmri_finetune.train_pre_post")
+        return bool(value) if value is not None else False
+    if isinstance(config, dict):
+        fastmri_config = config.get("fastmri_finetune", {})
+        if isinstance(fastmri_config, dict):
+            return bool(fastmri_config.get("train_pre_post", False))
+    return False
+
+
+def extract_fastmri_adapter_state(
+    model: SNRAwareWithGFactor,
+    *,
+    include_pre_post: bool,
+) -> dict[str, torch.Tensor]:
+    """Extract FastMRI adapter state, optionally including pre/post layers."""
     if not has_lora_adapters(model.base_model):
         return {}
-    return extract_lora_state_dict(model.base_model)
+    selected = {}
+    for name, tensor in model.base_model.state_dict().items():
+        if ".lora_A." in name or ".lora_B." in name or (
+            include_pre_post and (name.startswith("pre.") or name.startswith("post."))
+        ):
+            selected[name] = tensor.detach().cpu()
+    return selected
 
 
 def _is_adapter_state_key(name: str) -> bool:
@@ -450,6 +472,7 @@ def save_fastmri_finetune_checkpoint(
         model_config=getattr(model.base_model, "config", None),
         lora_config=lora_config,
     )
+    train_pre_post = _resolve_fastmri_train_pre_post(config)
     payload = {
         "checkpoint_type": FASTMRI_FINETUNE_CHECKPOINT_TYPE,
         "mode": mode,
@@ -458,8 +481,12 @@ def save_fastmri_finetune_checkpoint(
         "metrics": metrics or {},
         "config": OmegaConf.to_container(config, resolve=False) if isinstance(config, DictConfig) else config,
         "lora_config": asdict(resolved_lora_config),
+        "train_pre_post": train_pre_post,
         "gfactor_unet": {key: value.detach().cpu() for key, value in model.gfactor_unet.state_dict().items()},
-        "lora_adapter": extract_fastmri_adapter_state(model),
+        "lora_adapter": extract_fastmri_adapter_state(
+            model,
+            include_pre_post=train_pre_post,
+        ),
     }
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
@@ -499,7 +526,8 @@ def load_fastmri_finetune_checkpoint(
     if not has_lora_adapters(model.base_model):
         apply_lora_fn(model.base_model, lora_config=resolved_lora_config)
     missing, unexpected = model.base_model.load_state_dict(lora_state, strict=False)
-    filtered_missing = [name for name in missing if _is_adapter_state_key(name)]
+    expected_adapter_keys = set(lora_state)
+    filtered_missing = [name for name in missing if name in expected_adapter_keys]
     return filtered_missing, unexpected
 
 

@@ -119,6 +119,7 @@ fastmri_finetune:
   device: "auto"
   use_bf16: true
   gradient_checkpoint_frozen_base: true
+  train_pre_post: false
   gfactor_unet:
     in_chans: 2
     out_chans: 1
