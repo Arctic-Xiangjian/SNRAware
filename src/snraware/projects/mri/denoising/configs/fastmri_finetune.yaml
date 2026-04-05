@@ -97,6 +97,7 @@ fastmri_finetune:
   scanner_models: null
   acc_factor: 4
   crop_size: [320, 320]
+  train_patch_size: null
   deterministic_mask_from_name: false
   sample_seed: null
   batch_size: 1

@@ -121,6 +121,7 @@ class FastMRISNRAwareDataset(Dataset):
         scanner_models: list[str] | None = None,
         acc_factor: int = 4,
         crop_size: tuple[int, int] = (320, 320),
+        train_patch_size: tuple[int, int] | None = None,
         strict_latent_feature: bool = False,
         deterministic_mask_from_name: bool = False,
         sample_seed: int | None = None,
@@ -134,7 +135,20 @@ class FastMRISNRAwareDataset(Dataset):
         self.split = split
         self.acc_factor = int(acc_factor)
         self.crop_size = tuple(int(dim) for dim in crop_size)
+        self.train_patch_size = (
+            None if train_patch_size is None else tuple(int(dim) for dim in train_patch_size)
+        )
         self.deterministic_mask_from_name = deterministic_mask_from_name
+        if self.train_patch_size is not None:
+            if any(dim <= 0 for dim in self.train_patch_size):
+                raise ValueError(f"train_patch_size must contain positive integers, got {self.train_patch_size}")
+            if (
+                self.train_patch_size[0] > self.crop_size[0]
+                or self.train_patch_size[1] > self.crop_size[1]
+            ):
+                raise ValueError(
+                    f"train_patch_size {self.train_patch_size} must fit inside crop_size {self.crop_size}"
+                )
 
         self.slice_dataset = SliceDataset(
             root=root,
@@ -152,6 +166,29 @@ class FastMRISNRAwareDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.slice_dataset)
+
+    def _maybe_random_crop_train_patch(
+        self,
+        under_recon_slice: torch.Tensor,
+        clean_mag: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.split != "train" or self.train_patch_size is None:
+            return under_recon_slice, clean_mag
+
+        patch_h, patch_w = self.train_patch_size
+        full_h, full_w = clean_mag.shape[-2:]
+        max_top = full_h - patch_h
+        max_left = full_w - patch_w
+        if max_top < 0 or max_left < 0:
+            raise ValueError(
+                f"train_patch_size {self.train_patch_size} must fit inside cropped image {(full_h, full_w)}"
+            )
+
+        top = int(torch.randint(0, max_top + 1, ()).item())
+        left = int(torch.randint(0, max_left + 1, ()).item())
+        under_recon_slice = under_recon_slice[:, top : top + patch_h, left : left + patch_w, :]
+        clean_mag = clean_mag[:, top : top + patch_h, left : left + patch_w]
+        return under_recon_slice, clean_mag
 
     def _build_sample(
         self,
@@ -195,6 +232,7 @@ class FastMRISNRAwareDataset(Dataset):
 
         under_recon_slice = under_recon_slice / lq_running_std
         clean_mag = clean_mag / lq_running_std
+        under_recon_slice, clean_mag = self._maybe_random_crop_train_patch(under_recon_slice, clean_mag)
 
         noisy = rearrange(under_recon_slice.squeeze(0), "h w c -> c h w").contiguous()
         clean = clean_mag.contiguous()

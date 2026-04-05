@@ -38,6 +38,7 @@ __all__ = [
     "fastmri_autocast_context",
     "group_slices_into_volumes",
     "resolve_fastmri_precision",
+    "resolve_train_patch_size",
     "seed_everything",
     "should_checkpoint_frozen_base",
 ]
@@ -64,6 +65,19 @@ def complex_output_to_magnitude(output: torch.Tensor) -> torch.Tensor:
             f"FastMRI fine-tuning expects singleton T=1, got magnitude shape {tuple(magnitude.shape)}"
         )
     return magnitude.squeeze(2)
+
+
+def resolve_train_patch_size(ft_cfg: Any) -> tuple[int, int] | None:
+    """Normalize the optional FastMRI training patch size config."""
+    value = ft_cfg.get("train_patch_size", None)
+    if value in (None, "", "null"):
+        return None
+    patch_size = tuple(int(dim) for dim in value)
+    if len(patch_size) != 2:
+        raise ValueError(f"fastmri_finetune.train_patch_size must contain exactly two values, got {value}")
+    if any(dim <= 0 for dim in patch_size):
+        raise ValueError(f"fastmri_finetune.train_patch_size must be positive, got {patch_size}")
+    return patch_size
 
 
 def resolve_fastmri_precision(device: torch.device, *, use_bf16: bool) -> dict[str, Any]:
@@ -140,6 +154,46 @@ def _configure_fastmri_base_model_trainable_state(
 
 def _resolve_train_pre_post(ft_cfg: Any) -> bool:
     return bool(ft_cfg.get("train_pre_post", False))
+
+
+def _resolve_eval_patch_overlap(config: DictConfig, patch_size: tuple[int, int]) -> tuple[int, int]:
+    overlap_values = config.get("overlap_for_inference", [0, 0, 0])
+    if len(overlap_values) < 2:
+        raise ValueError("overlap_for_inference must provide at least two spatial values")
+    overlap = (int(overlap_values[0]), int(overlap_values[1]))
+    if overlap[0] < 0 or overlap[1] < 0:
+        raise ValueError(f"overlap_for_inference must be non-negative, got {overlap}")
+    if overlap[0] >= patch_size[0] or overlap[1] >= patch_size[1]:
+        raise ValueError(
+            "FastMRI spatial overlap_for_inference must be smaller than train_patch_size, "
+            f"got overlap={overlap}, train_patch_size={patch_size}"
+        )
+    return overlap
+
+
+def _stack_fastmri_batch(
+    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
+    noisy = torch.stack([sample[0] for sample in batch], dim=0)
+    clean = torch.stack([sample[1] for sample in batch], dim=0)
+    noise_sigma = torch.stack([torch.as_tensor(sample[2], dtype=torch.float32) for sample in batch], dim=0)
+
+    metadata_entries = [sample[3] for sample in batch]
+    metadata: dict[str, Any] = {}
+    for key in metadata_entries[0]:
+        values = [entry[key] for entry in metadata_entries]
+        if key in {"name", "volume_name"}:
+            metadata[key] = [str(value) for value in values]
+        elif key == "slice_idx":
+            metadata[key] = torch.tensor([int(value) for value in values], dtype=torch.int64)
+        elif all(value is None for value in values):
+            metadata[key] = None
+        elif any(value is None for value in values):
+            raise ValueError(f"Mixed None/non-None values for metadata['{key}'] in the same batch")
+        else:
+            metadata[key] = torch.stack([torch.as_tensor(value) for value in values], dim=0)
+
+    return noisy, clean, noise_sigma, metadata
 
 
 def build_fastmri_optimizer(
@@ -358,6 +412,7 @@ def build_fastmri_dataloaders(
     ):
         if root in (None, "", "null"):
             return None
+        train_patch_size = resolve_train_patch_size(ft_cfg) if split == "train" else None
         return FastMRISNRAwareDataset(
             root=root,
             split=split,
@@ -369,6 +424,7 @@ def build_fastmri_dataloaders(
             scanner_models=ft_cfg.scanner_models,
             acc_factor=ft_cfg.acc_factor,
             crop_size=tuple(ft_cfg.crop_size),
+            train_patch_size=train_patch_size,
             strict_latent_feature=False,
             deterministic_mask_from_name=bool(ft_cfg.deterministic_mask_from_name),
             sample_seed=ft_cfg.sample_seed,
@@ -394,6 +450,7 @@ def build_fastmri_dataloaders(
         "pin_memory": bool(ft_cfg.pin_memory),
         "persistent_workers": bool(ft_cfg.persistent_workers) if int(ft_cfg.num_workers) > 0 else False,
         "drop_last": False,
+        "collate_fn": _stack_fastmri_batch,
     }
 
     train_loader = DataLoader(train_dataset, shuffle=bool(ft_cfg.shuffle_train), **loader_kwargs)
@@ -434,6 +491,12 @@ class FastMRIFineTuneTrainer:
         self.precision_mode = str(self.precision_state["mode"])
         self.gradient_checkpoint_frozen_base = bool(
             self.ft_cfg.get("gradient_checkpoint_frozen_base", True)
+        )
+        self.train_patch_size = resolve_train_patch_size(self.ft_cfg)
+        self.eval_patch_overlap = (
+            _resolve_eval_patch_overlap(config, self.train_patch_size)
+            if self.train_patch_size is not None
+            else None
         )
         self.model = model.to(device=device, dtype=torch.float32)
         self.run_dir = Path(run_dir)
@@ -582,6 +645,79 @@ class FastMRIFineTuneTrainer:
         target_list = [target[idx].numpy() for idx in range(target.shape[0])]
         return volume_names, slice_indices, prediction_list, target_list
 
+    def _should_use_eval_patch_inference(self, noisy: torch.Tensor) -> bool:
+        if self.train_patch_size is None:
+            return False
+        return tuple(int(dim) for dim in noisy.shape[-2:]) != self.train_patch_size
+
+    @staticmethod
+    def _sliding_window_positions(size: int, patch_size: int, overlap: int) -> list[int]:
+        if patch_size > size:
+            raise ValueError(f"Patch size {patch_size} cannot exceed image size {size}")
+        stride = patch_size - overlap
+        if stride <= 0:
+            raise ValueError(
+                f"Sliding-window stride must be positive, got patch_size={patch_size}, overlap={overlap}"
+            )
+        positions = list(range(0, size - patch_size + 1, stride))
+        if not positions:
+            return [0]
+        final_position = size - patch_size
+        if positions[-1] != final_position:
+            positions.append(final_position)
+        return positions
+
+    def _run_eval_patch_inference(self, noisy: torch.Tensor) -> torch.Tensor:
+        if self.train_patch_size is None or self.eval_patch_overlap is None:
+            raise RuntimeError("Patch inference requested without an active train_patch_size configuration")
+
+        patch_h, patch_w = self.train_patch_size
+        overlap_h, overlap_w = self.eval_patch_overlap
+        patch_batch_size = max(1, int(self.ft_cfg.get("batch_size", 1)))
+        batch_predictions: list[torch.Tensor] = []
+
+        for sample in noisy:
+            _, full_h, full_w = sample.shape
+            top_positions = self._sliding_window_positions(full_h, patch_h, overlap_h)
+            left_positions = self._sliding_window_positions(full_w, patch_w, overlap_w)
+
+            pred_sum = torch.zeros((2, full_h, full_w), device=self.device, dtype=torch.float32)
+            weight_sum = torch.zeros((1, full_h, full_w), device=self.device, dtype=torch.float32)
+            patch_buffer: list[torch.Tensor] = []
+            coord_buffer: list[tuple[int, int]] = []
+
+            def flush_patch_buffer() -> None:
+                if not patch_buffer:
+                    return
+                patch_tensor = torch.stack(patch_buffer, dim=0).to(
+                    self.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                patch_output = self.model(patch_tensor, checkpoint_base_model=False).squeeze(2).float()
+                for index, (top, left) in enumerate(coord_buffer):
+                    pred_sum[:, top : top + patch_h, left : left + patch_w] += patch_output[index]
+                    weight_sum[:, top : top + patch_h, left : left + patch_w] += 1.0
+                patch_buffer.clear()
+                coord_buffer.clear()
+
+            for top in top_positions:
+                for left in left_positions:
+                    patch_buffer.append(sample[:, top : top + patch_h, left : left + patch_w])
+                    coord_buffer.append((top, left))
+                    if len(patch_buffer) >= patch_batch_size:
+                        flush_patch_buffer()
+
+            flush_patch_buffer()
+            batch_predictions.append(pred_sum / weight_sum.clamp_min(1.0))
+
+        return torch.stack(batch_predictions, dim=0).unsqueeze(2)
+
+    def _forward_eval_batch(self, noisy: torch.Tensor) -> torch.Tensor:
+        if self._should_use_eval_patch_inference(noisy):
+            return self._run_eval_patch_inference(noisy)
+        return self.model(noisy, checkpoint_base_model=False)
+
     def train_one_epoch(self, epoch: int) -> dict[str, float]:
         self._maybe_activate_adapters(epoch)
         self.model.train()
@@ -643,7 +779,7 @@ class FastMRIFineTuneTrainer:
                 clean = clean.to(self.device, dtype=torch.float32, non_blocking=True)
 
                 with self._autocast_context(enabled=False):
-                    output = self.model(noisy, checkpoint_base_model=False)
+                    output = self._forward_eval_batch(noisy)
                     magnitude_output = complex_output_to_magnitude(output)
                 magnitude_output = magnitude_output.float()
                 loss = self.loss_fn(magnitude_output, clean)

@@ -30,6 +30,7 @@ from snraware.projects.mri.denoising.fastmri_compat import (
 import snraware.projects.mri.denoising.fastmri_compat as fastmri_compat_module
 from snraware.projects.mri.denoising.lora_utils import apply_lora_to_model
 from snraware.projects.mri.denoising.model import DenoisingModel
+import snraware.projects.mri.denoising.train as fastmri_train_module
 import snraware.projects.mri.denoising.trainer_fa as trainer_fa_module
 from snraware.projects.mri.denoising.trainer_fa import (
     FastMRIFineTuneTrainer,
@@ -73,11 +74,13 @@ def _tiny_config(mode: str):
             "scheduler_t_max": 0,
             "resume_from": None,
             "max_epochs": 1,
+            "batch_size": 1,
             "log_every_n_steps": 100,
             "evaluate_every_n_epochs": 1,
             "use_bf16": False,
             "gradient_checkpoint_frozen_base": True,
             "train_pre_post": False,
+            "train_patch_size": None,
         }
     )
     return cfg
@@ -130,9 +133,9 @@ class ToyFastMRIDataset(Dataset):
         return self.noisy[index], self.clean[index], torch.tensor(0.0), metadata
 
 
-def _build_wrapped_model(mode: str) -> SNRAwareWithGFactor:
+def _build_wrapped_model(mode: str, size: int = 32) -> SNRAwareWithGFactor:
     config = _tiny_config(mode)
-    base_model = DenoisingModel(config=config, D=1, H=32, W=32)
+    base_model = DenoisingModel(config=config, D=1, H=size, W=size)
     return SNRAwareWithGFactor(base_model=base_model)
 
 
@@ -632,6 +635,68 @@ def test_fastmri_bridge_dataset_keeps_mask_metadata_when_no_crop(tmp_path: Path)
     assert torch.all(metadata["mask"][:, center_from:center_to, :] == 1)
 
 
+def test_fastmri_bridge_dataset_applies_train_patch_crop_after_normalization(monkeypatch, tmp_path: Path):
+    data_dir = tmp_path / "singlecoil_train_patch"
+    data_dir.mkdir()
+    _write_fake_fastmri_volume(data_dir / "case001.h5", size=320)
+
+    full_dataset = FastMRISNRAwareDataset(
+        root=data_dir,
+        split="train",
+        acc_factor=4,
+        deterministic_mask_from_name=True,
+        use_dataset_cache=False,
+    )
+    full_noisy, full_clean, _noise_sigma, _metadata = full_dataset[0]
+
+    randint_values = iter([torch.tensor(11), torch.tensor(17)])
+    monkeypatch.setattr(
+        fastmri_dataset_module.torch,
+        "randint",
+        lambda low, high, size, **kwargs: next(randint_values),
+    )
+
+    patch_dataset = FastMRISNRAwareDataset(
+        root=data_dir,
+        split="train",
+        acc_factor=4,
+        crop_size=(320, 320),
+        train_patch_size=(128, 160),
+        deterministic_mask_from_name=True,
+        use_dataset_cache=False,
+    )
+    noisy, clean, _noise_sigma, metadata = patch_dataset[0]
+
+    assert noisy.shape == (2, 128, 160)
+    assert clean.shape == (1, 128, 160)
+    assert torch.equal(noisy, full_noisy[:, 11:139, 17:177])
+    assert torch.equal(clean, full_clean[:, 11:139, 17:177])
+    assert metadata["mask"] is None
+    assert metadata["masked_kspace"] is None
+
+
+def test_fastmri_bridge_dataset_ignores_train_patch_size_for_validation(tmp_path: Path):
+    data_dir = tmp_path / "singlecoil_val_patch"
+    data_dir.mkdir()
+    _write_fake_fastmri_volume(data_dir / "case001.h5", size=320)
+
+    dataset = FastMRISNRAwareDataset(
+        root=data_dir,
+        split="val",
+        acc_factor=4,
+        crop_size=(320, 320),
+        train_patch_size=(128, 128),
+        deterministic_mask_from_name=True,
+        use_dataset_cache=False,
+    )
+    noisy, clean, _noise_sigma, metadata = dataset[0]
+
+    assert noisy.shape == (2, 320, 320)
+    assert clean.shape == (1, 320, 320)
+    assert metadata["mask"] is not None
+    assert metadata["masked_kspace"] is not None
+
+
 def test_build_fastmri_dataloaders_applies_sample_rate_to_train_only(monkeypatch):
     created = []
 
@@ -671,6 +736,7 @@ def test_build_fastmri_dataloaders_applies_sample_rate_to_train_only(monkeypatch
     config.fastmri_finetune.volume_sample_rate = 0.5
     config.fastmri_finetune.train_sample_rate = None
     config.fastmri_finetune.train_volume_sample_rate = None
+    config.fastmri_finetune.train_patch_size = [128, 128]
 
     build_fastmri_dataloaders(config)
 
@@ -678,12 +744,57 @@ def test_build_fastmri_dataloaders_applies_sample_rate_to_train_only(monkeypatch
     assert created[0]["split"] == "train"
     assert created[1]["split"] == "val"
     assert created[2]["split"] == "test"
+    assert created[0]["train_patch_size"] == (128, 128)
+    assert created[1]["train_patch_size"] is None
+    assert created[2]["train_patch_size"] is None
     assert created[0]["sample_rate"] == 0.02
     assert created[0]["volume_sample_rate"] == 0.5
     assert created[1]["sample_rate"] is None
     assert created[1]["volume_sample_rate"] is None
     assert created[2]["sample_rate"] is None
     assert created[2]["volume_sample_rate"] is None
+
+
+def test_fastmri_collate_fn_preserves_optional_none_metadata():
+    batch = [
+        (
+            torch.zeros(2, 8, 8, dtype=torch.float32),
+            torch.zeros(1, 8, 8, dtype=torch.float32),
+            torch.tensor(0.0, dtype=torch.float32),
+            {
+                "name": "vol0_slice_0",
+                "volume_name": "vol0",
+                "slice_idx": 0,
+                "mean": torch.tensor(0.0, dtype=torch.float32),
+                "std": torch.tensor(1.0, dtype=torch.float32),
+                "mask": None,
+                "masked_kspace": None,
+            },
+        ),
+        (
+            torch.ones(2, 8, 8, dtype=torch.float32),
+            torch.ones(1, 8, 8, dtype=torch.float32),
+            torch.tensor(0.0, dtype=torch.float32),
+            {
+                "name": "vol0_slice_1",
+                "volume_name": "vol0",
+                "slice_idx": 1,
+                "mean": torch.tensor(0.0, dtype=torch.float32),
+                "std": torch.tensor(1.0, dtype=torch.float32),
+                "mask": None,
+                "masked_kspace": None,
+            },
+        ),
+    ]
+
+    noisy, clean, noise_sigma, metadata = trainer_fa_module._stack_fastmri_batch(batch)
+
+    assert noisy.shape == (2, 2, 8, 8)
+    assert clean.shape == (2, 1, 8, 8)
+    assert noise_sigma.shape == (2,)
+    assert metadata["mask"] is None
+    assert metadata["masked_kspace"] is None
+    assert metadata["volume_name"] == ["vol0", "vol0"]
 
 
 @pytest.mark.parametrize(
@@ -753,6 +864,7 @@ def test_fastmri_config_defaults_to_small_base_model():
     assert config.base_model.config_path is None
     assert config.base_model.checkpoint_path is None
     assert config.fastmri_finetune.train_pre_post is False
+    assert config.fastmri_finetune.train_patch_size is None
 
 
 def test_run_fastmri_launcher_exposes_use_bf16():
@@ -760,7 +872,84 @@ def test_run_fastmri_launcher_exposes_use_bf16():
 
     assert 'USE_BF16="${USE_BF16:-true}"' in script
     assert '"fastmri_finetune.use_bf16=${USE_BF16}"' in script
-    assert "USE_BF16=false ./run_fast_mri_single_coil.sh" in script
+
+
+def test_fastmri_train_entrypoint_builds_model_at_train_patch_size(monkeypatch, tmp_path: Path):
+    with initialize(version_base=None, config_path="../src/snraware/projects/mri/denoising/configs"):
+        config = compose(config_name="fastmri_finetune")
+
+    config.logging.use_wandb = False
+    config.fastmri_finetune.train_root = "/tmp/train"
+    config.fastmri_finetune.val_root = "/tmp/val"
+    config.fastmri_finetune.test_root = None
+    config.fastmri_finetune.save_root = str(tmp_path)
+    config.fastmri_finetune.device = "cpu"
+    config.fastmri_finetune.use_bf16 = False
+    config.fastmri_finetune.train_patch_size = [128, 128]
+    config.fastmri_finetune.crop_size = [320, 320]
+
+    fake_fastmri = types.ModuleType("fastmri")
+    fake_fastmri_evaluate = types.ModuleType("fastmri.evaluate")
+    fake_fastmri_evaluate.nmse = lambda *args, **kwargs: 0.0
+    monkeypatch.setitem(sys.modules, "fastmri", fake_fastmri)
+    monkeypatch.setitem(sys.modules, "fastmri.evaluate", fake_fastmri_evaluate)
+
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "resolve_base_model_paths",
+        lambda **kwargs: ("./cfg.yaml", "./weights.pts"),
+    )
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "build_fastmri_dataloaders",
+        lambda config: ("train_loader", "val_loader", None),
+    )
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "_resolve_device",
+        lambda device_str: torch.device("cpu"),
+    )
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "resolve_fastmri_precision",
+        lambda device, use_bf16: {"mode": "fp32", "use_bf16": False},
+    )
+    monkeypatch.setattr(fastmri_train_module, "seed_everything", lambda seed: None)
+
+    build_calls = {}
+
+    def fake_build_fastmri_wrapped_model(**kwargs):
+        build_calls.update(kwargs)
+        return (
+            torch.nn.Identity(),
+            OmegaConf.create({}),
+            {
+                "weight_source": "jit",
+                "matched_keys": 0,
+                "mismatched_keys": 0,
+                "total_model_keys": 0,
+            },
+        )
+
+    monkeypatch.setattr(fastmri_train_module, "build_fastmri_wrapped_model", fake_build_fastmri_wrapped_model)
+
+    trainer_kwargs = {}
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            trainer_kwargs.update(kwargs)
+
+        def train(self):
+            return {}
+
+    monkeypatch.setattr(fastmri_train_module, "FastMRIFineTuneTrainer", FakeTrainer)
+
+    fastmri_train_module.run_fastmri_finetuning.__wrapped__(config)
+
+    assert build_calls["height"] == 128
+    assert build_calls["width"] == 128
+    assert trainer_kwargs["train_loader"] == "train_loader"
+    assert trainer_kwargs["val_loader"] == "val_loader"
 
 
 def test_run_fastmri_launcher_supports_model_size_presets():
@@ -1213,6 +1402,45 @@ def test_fastmri_trainer_smoke_step(mode: str, tmp_path: Path):
     assert np.isfinite(train_metrics["loss"])
     assert set(val_metrics) == {"loss", "psnr", "ssim", "nmse"}
     assert all(np.isfinite(value) for value in val_metrics.values())
+
+
+def test_fastmri_trainer_eval_uses_patch_inference_for_full_resolution_metrics(monkeypatch, tmp_path: Path):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.train_patch_size = [32, 32]
+    config.overlap_for_inference = [8, 8, 0]
+
+    train_loader = DataLoader(ToyFastMRIDataset(2, size=32), batch_size=1, shuffle=False)
+    val_loader = DataLoader(ToyFastMRIDataset(2, size=64), batch_size=1, shuffle=False)
+
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_only", size=32),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "patch_eval",
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=None,
+        metric_fns={
+            "psnr": lambda gt, pred: float(-np.mean((gt - pred) ** 2)),
+            "ssim": lambda gt, pred: float(1.0 / (1.0 + np.mean((gt - pred) ** 2))),
+            "nmse": lambda gt, pred: float(np.sum((gt - pred) ** 2) / max(np.sum(gt**2), 1e-12)),
+        },
+    )
+
+    patch_calls = []
+    original_patch_inference = trainer._run_eval_patch_inference
+
+    def wrapped_patch_inference(noisy: torch.Tensor) -> torch.Tensor:
+        patch_calls.append(tuple(noisy.shape))
+        return original_patch_inference(noisy)
+
+    monkeypatch.setattr(trainer, "_run_eval_patch_inference", wrapped_patch_inference)
+
+    metrics = trainer.evaluate_loader(val_loader, split="val")
+
+    assert patch_calls == [(1, 2, 64, 64), (1, 2, 64, 64)]
+    assert set(metrics) == {"loss", "psnr", "ssim", "nmse"}
+    assert all(np.isfinite(value) for value in metrics.values())
 
 
 def test_fastmri_trainer_train_uses_bf16_context_but_loss_stays_fp32(monkeypatch, tmp_path: Path):

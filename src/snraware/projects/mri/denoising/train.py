@@ -16,6 +16,7 @@ from snraware.projects.mri.denoising.trainer_fa import (
     FastMRIFineTuneTrainer,
     build_fastmri_dataloaders,
     resolve_fastmri_precision,
+    resolve_train_patch_size,
     seed_everything,
 )
 
@@ -107,6 +108,8 @@ def run_fastmri_finetuning(config: DictConfig):
         use_bf16=bool(config.fastmri_finetune.use_bf16),
     )
     crop_h, crop_w = [int(dim) for dim in config.fastmri_finetune.crop_size]
+    train_patch_size = resolve_train_patch_size(config.fastmri_finetune)
+    model_h, model_w = train_patch_size or (crop_h, crop_w)
 
     print(
         f"{Fore.GREEN}Training precision: {precision_state['mode']} "
@@ -117,8 +120,8 @@ def run_fastmri_finetuning(config: DictConfig):
     model, base_config, load_info = build_fastmri_wrapped_model(
         base_config_path=config.base_model.config_path,
         base_checkpoint_path=config.base_model.checkpoint_path,
-        height=crop_h,
-        width=crop_w,
+        height=model_h,
+        width=model_w,
         depth=1,
         lora_config=config.get("lora"),
         gfactor_unet_kwargs=OmegaConf.to_container(
