@@ -30,6 +30,7 @@ from snraware.projects.mri.denoising.lora_utils import (
 
 __all__ = [
     "FastMRIFineTuneTrainer",
+    "build_fastmri_optimizer",
     "build_fastmri_dataloaders",
     "complex_output_to_magnitude",
     "compute_volume_metrics",
@@ -38,6 +39,7 @@ __all__ = [
     "group_slices_into_volumes",
     "resolve_fastmri_precision",
     "seed_everything",
+    "should_checkpoint_frozen_base",
 ]
 
 
@@ -109,6 +111,58 @@ def _set_adapter_trainable(base_model: nn.Module, flag: bool) -> None:
 
 def _get_adapter_parameters(base_model: nn.Module) -> list[nn.Parameter]:
     return [parameter for name, parameter in base_model.named_parameters() if _is_adapter_parameter(name)]
+
+
+def build_fastmri_optimizer(
+    model: SNRAwareWithGFactor,
+    ft_cfg: Any,
+    mode_state: dict[str, Any],
+) -> torch.optim.Optimizer:
+    """Build the FastMRI AdamW optimizer with trainer-matching parameter groups."""
+    param_groups = []
+    gfactor_params = list(model.gfactor_unet.parameters())
+    adapter_params = _get_adapter_parameters(model.base_model)
+
+    if any(parameter.requires_grad for parameter in gfactor_params) or ft_cfg.mode == "warmup_then_both":
+        param_groups.append(
+            {
+                "name": "gfactor_unet",
+                "params": gfactor_params,
+                "lr": float(ft_cfg.unet_lr),
+                "weight_decay": float(ft_cfg.weight_decay),
+            }
+        )
+
+    if adapter_params:
+        adapter_lr = (
+            0.0 if ft_cfg.mode == "warmup_then_both" and not mode_state["adapters_active"] else float(ft_cfg.adapter_lr)
+        )
+        param_groups.append(
+            {
+                "name": "adapter",
+                "params": adapter_params,
+                "lr": adapter_lr,
+                "weight_decay": float(ft_cfg.weight_decay),
+            }
+        )
+
+    if not param_groups:
+        raise RuntimeError("No parameter groups were created for FastMRI fine-tuning")
+
+    return torch.optim.AdamW(param_groups)
+
+
+def should_checkpoint_frozen_base(
+    model: SNRAwareWithGFactor,
+    *,
+    gradient_checkpoint_frozen_base: bool,
+) -> bool:
+    """Mirror the trainer policy for checkpointing a fully frozen SNRAware base model."""
+    return (
+        gradient_checkpoint_frozen_base
+        and model.training
+        and not any(parameter.requires_grad for parameter in model.base_model.parameters())
+    )
 
 
 def configure_model_for_finetune_mode(
@@ -355,39 +409,7 @@ class FastMRIFineTuneTrainer:
             self._load_resume_state(self.ft_cfg.resume_from)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
-        param_groups = []
-        gfactor_params = list(self.model.gfactor_unet.parameters())
-        adapter_params = _get_adapter_parameters(self.model.base_model)
-
-        if any(parameter.requires_grad for parameter in gfactor_params) or self.ft_cfg.mode == "warmup_then_both":
-            param_groups.append(
-                {
-                    "name": "gfactor_unet",
-                    "params": gfactor_params,
-                    "lr": float(self.ft_cfg.unet_lr),
-                    "weight_decay": float(self.ft_cfg.weight_decay),
-                }
-            )
-
-        if adapter_params:
-            adapter_lr = (
-                0.0
-                if self.ft_cfg.mode == "warmup_then_both" and not self.mode_state["adapters_active"]
-                else float(self.ft_cfg.adapter_lr)
-            )
-            param_groups.append(
-                {
-                    "name": "adapter",
-                    "params": adapter_params,
-                    "lr": adapter_lr,
-                    "weight_decay": float(self.ft_cfg.weight_decay),
-                }
-            )
-
-        if not param_groups:
-            raise RuntimeError("No parameter groups were created for FastMRI fine-tuning")
-
-        return torch.optim.AdamW(param_groups)
+        return build_fastmri_optimizer(self.model, self.ft_cfg, self.mode_state)
 
     def _build_scheduler(self) -> Any | None:
         t_max = int(self.ft_cfg.scheduler_t_max)
@@ -471,10 +493,9 @@ class FastMRIFineTuneTrainer:
         return any(parameter.requires_grad for parameter in self.model.base_model.parameters())
 
     def _should_checkpoint_frozen_base(self) -> bool:
-        return (
-            self.gradient_checkpoint_frozen_base
-            and self.model.training
-            and not self._base_model_has_trainable_parameters()
+        return should_checkpoint_frozen_base(
+            self.model,
+            gradient_checkpoint_frozen_base=self.gradient_checkpoint_frozen_base,
         )
 
     def _log(self, payload: dict[str, Any], step: int | None = None) -> None:
