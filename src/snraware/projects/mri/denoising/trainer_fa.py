@@ -495,6 +495,7 @@ class FastMRIFineTuneTrainer:
             self.ft_cfg.get("gradient_checkpoint_frozen_base", True)
         )
         self.train_patch_size = resolve_train_patch_size(self.ft_cfg)
+        self.eval_patch_batch_size = max(1, int(self.ft_cfg.get("eval_patch_batch_size", 64)))
         self.eval_patch_overlap = (
             _resolve_eval_patch_overlap(config, self.train_patch_size)
             if self.train_patch_size is not None
@@ -662,6 +663,7 @@ class FastMRIFineTuneTrainer:
             f"train_patch_size={self.train_patch_size or 'full'} | "
             f"eval_crop_size={eval_crop_size or 'unknown'} | "
             f"eval_patch_inference={'yes' if patch_inference_enabled else 'no'} | "
+            f"eval_patch_batch_size={self.eval_patch_batch_size} | "
             f"eval_patch_overlap={overlap_text} | "
             f"checkpoint_base_model={'yes' if self.gradient_checkpoint_frozen_base else 'no'}"
         )
@@ -750,7 +752,7 @@ class FastMRIFineTuneTrainer:
 
         patch_h, patch_w = self.train_patch_size
         overlap_h, overlap_w = self.eval_patch_overlap
-        patch_batch_size = max(1, int(self.ft_cfg.get("batch_size", 1)))
+        patch_batch_size = self.eval_patch_batch_size
         batch_predictions: list[torch.Tensor] = []
 
         for sample in noisy:

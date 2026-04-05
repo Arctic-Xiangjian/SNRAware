@@ -84,6 +84,7 @@ def _tiny_config(mode: str):
             "gradient_checkpoint_frozen_base": True,
             "train_pre_post": False,
             "train_patch_size": None,
+            "eval_patch_batch_size": 64,
         }
     )
     return cfg
@@ -868,6 +869,7 @@ def test_fastmri_config_defaults_to_small_base_model():
     assert config.base_model.checkpoint_path is None
     assert config.fastmri_finetune.train_pre_post is False
     assert list(config.fastmri_finetune.train_patch_size) == [64, 64]
+    assert int(config.fastmri_finetune.eval_patch_batch_size) == 64
 
 
 def test_run_fastmri_launcher_exposes_use_bf16():
@@ -881,12 +883,14 @@ def test_run_fastmri_launcher_exposes_patch_training_controls():
     script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
 
     assert 'TRAIN_PATCH_SIZE="${TRAIN_PATCH_SIZE:-64}"' in script
+    assert 'EVAL_PATCH_BATCH_SIZE="${EVAL_PATCH_BATCH_SIZE:-64}"' in script
     assert 'CROP_SIZE="${CROP_SIZE:-320}"' in script
     assert 'PATCH_OVERLAP="${PATCH_OVERLAP:-16}"' in script
     assert 'TRAIN_PRE_POST="$(normalize_bool "${TRAIN_PRE_POST:-false}")"' in script
     assert 'GRADIENT_CHECKPOINT_FROZEN_BASE="$(normalize_bool "${GRADIENT_CHECKPOINT_FROZEN_BASE:-true}")"' in script
     assert 'DRY_RUN="$(normalize_bool "${DRY_RUN:-false}")"' in script
     assert '"fastmri_finetune.train_patch_size=${RESOLVED_TRAIN_PATCH_HYDRA}"' in script
+    assert '"fastmri_finetune.eval_patch_batch_size=${EVAL_PATCH_BATCH_SIZE}"' in script
     assert '"fastmri_finetune.crop_size=${RESOLVED_CROP_HYDRA}"' in script
     assert '"overlap_for_inference=${RESOLVED_PATCH_OVERLAP_HYDRA}"' in script
     assert 'CHECKPOINT_NATIVE_SPATIAL_SIZE=' in script
@@ -901,6 +905,7 @@ def test_run_fastmri_launcher_dry_run_defaults_to_native_patch_size(tmp_path: Pa
     assert result.returncode == 0, result.stderr
     assert "TRAIN_INPUT_SIZE=64x64" in result.stdout
     assert "EVAL_CROP_SIZE=320x320" in result.stdout
+    assert "EVAL_PATCH_BATCH_SIZE=64" in result.stdout
     assert "CHECKPOINT_NATIVE_SPATIAL_SIZE=" in result.stdout
     assert "Native pretrained spatial size is 64x64" in result.stdout
     assert r"fastmri_finetune.train_patch_size=\[64\,64\]" in result.stdout
@@ -963,6 +968,7 @@ def test_run_fastmri_launcher_dry_run_emits_patch_overrides(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     assert "TRAIN_INPUT_SIZE=128x128" in result.stdout
     assert "EVAL_CROP_SIZE=320x320" in result.stdout
+    assert "EVAL_PATCH_BATCH_SIZE=64" in result.stdout
     assert "PATCH_INFERENCE_FOR_VAL_TEST=enabled" in result.stdout
     assert r"fastmri_finetune.train_patch_size=\[128\,128\]" in result.stdout
     assert r"fastmri_finetune.crop_size=\[320\,320\]" in result.stdout
@@ -1643,6 +1649,85 @@ def test_fastmri_trainer_eval_uses_patch_inference_for_full_resolution_metrics(m
     assert patch_calls == [(1, 2, 64, 64), (1, 2, 64, 64)]
     assert set(metrics) == {"loss", "psnr", "ssim", "nmse"}
     assert all(np.isfinite(value) for value in metrics.values())
+
+
+def test_fastmri_eval_uses_inference_mode_and_eval_flag(monkeypatch, tmp_path: Path):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.train_patch_size = [32, 32]
+    config.fastmri_finetune.eval_patch_batch_size = 4
+    config.overlap_for_inference = [8, 8, 0]
+
+    train_loader = DataLoader(ToyFastMRIDataset(1, size=32), batch_size=1, shuffle=False)
+    val_loader = DataLoader(ToyFastMRIDataset(1, size=64), batch_size=1, shuffle=False)
+
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_only", size=32),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "eval_mode_check",
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=None,
+        metric_fns={
+            "psnr": lambda gt, pred: float(-np.mean((gt - pred) ** 2)),
+            "ssim": lambda gt, pred: float(1.0 / (1.0 + np.mean((gt - pred) ** 2))),
+            "nmse": lambda gt, pred: float(np.sum((gt - pred) ** 2) / max(np.sum(gt**2), 1e-12)),
+        },
+    )
+
+    flags: list[tuple[bool, bool]] = []
+    original_forward = trainer.model.forward
+
+    def wrapped_forward(*args, **kwargs):
+        flags.append((trainer.model.training, torch.is_inference_mode_enabled()))
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(trainer.model, "forward", wrapped_forward)
+
+    trainer.evaluate_loader(val_loader, split="val")
+
+    assert flags
+    assert all(training_flag is False for training_flag, _ in flags)
+    assert all(inference_flag is True for _, inference_flag in flags)
+
+
+def test_fastmri_eval_patch_inference_uses_eval_patch_batch_size(monkeypatch, tmp_path: Path):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.train_patch_size = [32, 32]
+    config.fastmri_finetune.batch_size = 1
+    config.fastmri_finetune.eval_patch_batch_size = 3
+    config.overlap_for_inference = [8, 8, 0]
+
+    train_loader = DataLoader(ToyFastMRIDataset(1, size=32), batch_size=1, shuffle=False)
+    val_loader = DataLoader(ToyFastMRIDataset(1, size=64), batch_size=1, shuffle=False)
+
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_only", size=32),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "eval_patch_batch_size",
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=None,
+        metric_fns={
+            "psnr": lambda gt, pred: float(-np.mean((gt - pred) ** 2)),
+            "ssim": lambda gt, pred: float(1.0 / (1.0 + np.mean((gt - pred) ** 2))),
+            "nmse": lambda gt, pred: float(np.sum((gt - pred) ** 2) / max(np.sum(gt**2), 1e-12)),
+        },
+    )
+
+    patch_batch_sizes: list[int] = []
+    original_forward = trainer.model.forward
+
+    def wrapped_forward(x: torch.Tensor, **kwargs):
+        patch_batch_sizes.append(int(x.shape[0]))
+        return original_forward(x, **kwargs)
+
+    monkeypatch.setattr(trainer.model, "forward", wrapped_forward)
+
+    trainer.evaluate_loader(val_loader, split="val")
+
+    assert patch_batch_sizes == [3, 3, 3]
 
 
 def test_fastmri_trainer_prints_console_progress_summaries(tmp_path: Path, capsys: pytest.CaptureFixture[str]):

@@ -47,6 +47,7 @@ Environment variables you can change:
   ACC_FACTOR             Default: 8
   CROP_SIZE              Eval crop size. Accepts 320 or 320x320. Default: 320
   TRAIN_PATCH_SIZE       Train patch size. Accepts 64, 64x96, or null. Default: 64
+  EVAL_PATCH_BATCH_SIZE  Sliding-window patch batch size for val/test. Default: 64
   PATCH_OVERLAP          Eval patch overlap. Accepts 16 or 16x24. Default: 16
   BATCH_SIZE             Default: 1
   NUM_WORKERS            Default: 4
@@ -72,7 +73,7 @@ Examples:
   CUDA_DEVICE=0 ./run_fast_mri_single_coil.sh
   MODEL_SIZE=large ./run_fast_mri_single_coil.sh
   TRAIN_PATCH_SIZE=64 ./run_fast_mri_single_coil.sh
-  TRAIN_PATCH_SIZE=64x96 PATCH_OVERLAP=16x24 ./run_fast_mri_single_coil.sh
+  TRAIN_PATCH_SIZE=64x96 EVAL_PATCH_BATCH_SIZE=64 PATCH_OVERLAP=16x24 ./run_fast_mri_single_coil.sh
   TRAIN_PATCH_SIZE=null ./run_fast_mri_single_coil.sh
   USE_BF16=false ./run_fast_mri_single_coil.sh
   DRY_RUN=true ./run_fast_mri_single_coil.sh
@@ -177,6 +178,7 @@ MODE="${MODE:-warmup_then_both}"
 ACC_FACTOR="${ACC_FACTOR:-8}"
 CROP_SIZE="${CROP_SIZE:-320}"
 TRAIN_PATCH_SIZE="${TRAIN_PATCH_SIZE:-64}"
+EVAL_PATCH_BATCH_SIZE="${EVAL_PATCH_BATCH_SIZE:-64}"
 PATCH_OVERLAP="${PATCH_OVERLAP:-16}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
@@ -336,6 +338,7 @@ echo "  ACC_FACTOR=${ACC_FACTOR}"
 echo "  TRAIN_INPUT_SIZE=${TRAIN_INPUT_SIZE_LABEL}"
 echo "  EVAL_CROP_SIZE=${CROP_H}x${CROP_W}"
 echo "  TRAIN_PATCH_SIZE=${RESOLVED_TRAIN_PATCH_PAIR}"
+echo "  EVAL_PATCH_BATCH_SIZE=${EVAL_PATCH_BATCH_SIZE}"
 echo "  PATCH_OVERLAP=${PATCH_OVERLAP_LABEL}"
 echo "  PATCH_INFERENCE_FOR_VAL_TEST=${PATCH_INFERENCE_STATUS}"
 echo "  MAX_EPOCHS=${MAX_EPOCHS}"
@@ -362,6 +365,7 @@ CMD=(
   "fastmri_finetune.acc_factor=${ACC_FACTOR}"
   "fastmri_finetune.crop_size=${RESOLVED_CROP_HYDRA}"
   "fastmri_finetune.train_patch_size=${RESOLVED_TRAIN_PATCH_HYDRA}"
+  "fastmri_finetune.eval_patch_batch_size=${EVAL_PATCH_BATCH_SIZE}"
   "fastmri_finetune.mode=${MODE}"
   "fastmri_finetune.batch_size=${BATCH_SIZE}"
   "fastmri_finetune.num_workers=${NUM_WORKERS}"

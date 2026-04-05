@@ -98,6 +98,7 @@ fastmri_finetune:
   acc_factor: 4
   crop_size: [320, 320]
   train_patch_size: [64, 64]
+  eval_patch_batch_size: 64
   deterministic_mask_from_name: false
   sample_seed: null
   batch_size: 1
