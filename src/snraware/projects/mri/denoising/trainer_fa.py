@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -15,6 +16,7 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from snraware.projects.mri.denoising.fastmri_compat import (
     SNRAwareWithGFactor,
@@ -506,6 +508,7 @@ class FastMRIFineTuneTrainer:
         self.metric_fns = metric_fns
         self.wandb_run = wandb_run
         self.loss_fn = nn.L1Loss()
+        self._use_tqdm = bool(getattr(sys.stderr, "isatty", lambda: False)())
         self.mode_state = configure_model_for_finetune_mode(
             self.model,
             mode=self.ft_cfg.mode,
@@ -519,6 +522,8 @@ class FastMRIFineTuneTrainer:
 
         if self.ft_cfg.resume_from:
             self._load_resume_state(self.ft_cfg.resume_from)
+
+        self._print_startup_summary()
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         return build_fastmri_optimizer(self.model, self.ft_cfg, self.mode_state)
@@ -616,6 +621,78 @@ class FastMRIFineTuneTrainer:
         if self.wandb_run is not None:
             self.wandb_run.log(payload, step=step)
 
+    def _console_print(self, message: str) -> None:
+        print(message, flush=True)
+
+    @staticmethod
+    def _format_lr(value: float | None) -> str:
+        if value is None:
+            return "n/a"
+        return f"{float(value):.2e}"
+
+    @staticmethod
+    def _format_metric_value(value: float) -> str:
+        return "nan" if not np.isfinite(value) else f"{value:.4f}"
+
+    def _current_group_lr(self, group_name: str) -> float | None:
+        for group in self.optimizer.param_groups:
+            if group.get("name") == group_name:
+                return float(group["lr"])
+        return None
+
+    def _print_startup_summary(self) -> None:
+        crop_size_cfg = self.ft_cfg.get("crop_size", None)
+        eval_crop_size = (
+            tuple(int(dim) for dim in crop_size_cfg)
+            if crop_size_cfg is not None
+            else self.train_patch_size
+        )
+        patch_inference_enabled = self.train_patch_size is not None and (
+            eval_crop_size is None or self.train_patch_size != eval_crop_size
+        )
+        overlap_text = (
+            f"{self.eval_patch_overlap[0]}x{self.eval_patch_overlap[1]}"
+            if self.eval_patch_overlap is not None
+            else "n/a"
+        )
+        self._console_print(
+            "[FastMRI trainer] "
+            f"mode={self.ft_cfg.mode} | "
+            f"precision={self.precision_mode} | "
+            f"train_patch_size={self.train_patch_size or 'full'} | "
+            f"eval_crop_size={eval_crop_size or 'unknown'} | "
+            f"eval_patch_inference={'yes' if patch_inference_enabled else 'no'} | "
+            f"eval_patch_overlap={overlap_text} | "
+            f"checkpoint_base_model={'yes' if self.gradient_checkpoint_frozen_base else 'no'}"
+        )
+
+    def _print_epoch_header(self, epoch: int) -> None:
+        self._console_print(
+            "[Epoch "
+            f"{epoch + 1}/{int(self.ft_cfg.max_epochs)}] "
+            f"mode={self.ft_cfg.mode} | "
+            f"adapters_active={self.mode_state['adapters_active']} | "
+            f"checkpoint_base_model={self._should_checkpoint_frozen_base()} | "
+            f"lr_unet={self._format_lr(self._current_group_lr('gfactor_unet'))} | "
+            f"lr_adapter={self._format_lr(self._current_group_lr('adapter'))}"
+        )
+
+    def _print_metric_summary(self, split: str, metrics: dict[str, float]) -> None:
+        if split == "train":
+            self._console_print(
+                "[Train] "
+                f"loss={self._format_metric_value(metrics['loss'])}"
+            )
+            return
+
+        self._console_print(
+            f"[{split.capitalize()}] "
+            f"loss={self._format_metric_value(metrics['loss'])} | "
+            f"psnr={self._format_metric_value(metrics['psnr'])} | "
+            f"ssim={self._format_metric_value(metrics['ssim'])} | "
+            f"nmse={self._format_metric_value(metrics['nmse'])}"
+        )
+
     def _autocast_context(self, *, enabled: bool):
         return fastmri_autocast_context(self.device, enabled=enabled)
 
@@ -711,12 +788,25 @@ class FastMRIFineTuneTrainer:
             flush_patch_buffer()
             batch_predictions.append(pred_sum / weight_sum.clamp_min(1.0))
 
-        return torch.stack(batch_predictions, dim=0).unsqueeze(2)
+        output = torch.stack(batch_predictions, dim=0).unsqueeze(2)
+        if output.shape[0] != noisy.shape[0] or output.shape[-2:] != noisy.shape[-2:]:
+            raise RuntimeError(
+                "FastMRI patch inference stitch produced an unexpected output shape: "
+                f"got {tuple(output.shape)}, expected batch={noisy.shape[0]} "
+                f"and spatial={tuple(noisy.shape[-2:])}"
+            )
+        return output
 
     def _forward_eval_batch(self, noisy: torch.Tensor) -> torch.Tensor:
         if self._should_use_eval_patch_inference(noisy):
             return self._run_eval_patch_inference(noisy)
-        return self.model(noisy, checkpoint_base_model=False)
+        output = self.model(noisy, checkpoint_base_model=False)
+        if output.shape[-2:] != noisy.shape[-2:]:
+            raise RuntimeError(
+                "FastMRI evaluation forward changed the spatial size unexpectedly: "
+                f"input {tuple(noisy.shape)}, output {tuple(output.shape)}"
+            )
+        return output
 
     def train_one_epoch(self, epoch: int) -> dict[str, float]:
         self._maybe_activate_adapters(epoch)
@@ -727,7 +817,16 @@ class FastMRIFineTuneTrainer:
         step_count = 0
         step_start = time.time()
 
-        for step_idx, (noisy, clean, _noise_sigma, _metadata) in enumerate(self.train_loader):
+        progress = tqdm(
+            self.train_loader,
+            total=len(self.train_loader),
+            desc=f"train {epoch + 1}/{int(self.ft_cfg.max_epochs)}",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not self._use_tqdm,
+        )
+
+        for step_idx, (noisy, clean, _noise_sigma, _metadata) in enumerate(progress):
             noisy = noisy.to(self.device, dtype=torch.float32, non_blocking=True)
             clean = clean.to(self.device, dtype=torch.float32, non_blocking=True)
 
@@ -744,15 +843,42 @@ class FastMRIFineTuneTrainer:
             loss_sum += float(loss.item())
             step_count += 1
 
+            mean_loss = loss_sum / max(step_count, 1)
+            if self._use_tqdm:
+                progress.set_postfix(
+                    loss=f"{float(loss.item()):.4f}",
+                    avg=f"{mean_loss:.4f}",
+                    lr_u=self._format_lr(self._current_group_lr("gfactor_unet")),
+                    lr_a=self._format_lr(self._current_group_lr("adapter")),
+                    prec=self.precision_mode,
+                    adapters="on" if self.mode_state["adapters_active"] else "off",
+                    ckpt="on" if checkpoint_frozen_base else "off",
+                )
+
             if (step_idx + 1) % int(self.ft_cfg.log_every_n_steps) == 0:
                 elapsed = time.time() - step_start
                 self._log(
                     {
-                        "train/loss": loss_sum / step_count,
+                        "train/loss": mean_loss,
                         "train/epoch": epoch,
                         "train/steps_per_sec": step_count / max(elapsed, 1e-12),
                     }
                 )
+                if not self._use_tqdm:
+                    self._console_print(
+                        "[Train step "
+                        f"{step_idx + 1}/{len(self.train_loader)}] "
+                        f"loss={float(loss.item()):.4f} | "
+                        f"avg_loss={mean_loss:.4f} | "
+                        f"lr_unet={self._format_lr(self._current_group_lr('gfactor_unet'))} | "
+                        f"lr_adapter={self._format_lr(self._current_group_lr('adapter'))} | "
+                        f"precision={self.precision_mode} | "
+                        f"adapters_active={self.mode_state['adapters_active']} | "
+                        f"checkpoint_base_model={checkpoint_frozen_base}"
+                    )
+
+        if self._use_tqdm:
+            progress.close()
 
         if self.scheduler is not None:
             self.scheduler.step()
@@ -773,8 +899,17 @@ class FastMRIFineTuneTrainer:
         predictions: list[np.ndarray] = []
         targets: list[np.ndarray] = []
 
+        progress = tqdm(
+            loader,
+            total=len(loader),
+            desc=f"{split} eval",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not self._use_tqdm,
+        )
+
         with torch.inference_mode():
-            for noisy, clean, _noise_sigma, metadata in loader:
+            for batch_idx, (noisy, clean, _noise_sigma, metadata) in enumerate(progress):
                 noisy = noisy.to(self.device, dtype=torch.float32, non_blocking=True)
                 clean = clean.to(self.device, dtype=torch.float32, non_blocking=True)
 
@@ -796,6 +931,16 @@ class FastMRIFineTuneTrainer:
                 slice_indices.extend(batch_slice_indices)
                 predictions.extend(batch_predictions)
                 targets.extend(batch_targets)
+                if self._use_tqdm:
+                    progress.set_postfix(loss=f"{loss_sum / max(batch_count, 1):.4f}")
+                elif (batch_idx + 1) % max(1, int(self.ft_cfg.log_every_n_steps)) == 0:
+                    self._console_print(
+                        f"[{split.capitalize()} step {batch_idx + 1}/{len(loader)}] "
+                        f"loss={loss_sum / max(batch_count, 1):.4f}"
+                    )
+
+        if self._use_tqdm:
+            progress.close()
 
         grouped = group_slices_into_volumes(volume_names, slice_indices, predictions, targets)
         metric_values = compute_volume_metrics(grouped, metric_fns=self.metric_fns)
@@ -835,8 +980,10 @@ class FastMRIFineTuneTrainer:
 
         for epoch in range(self.current_epoch, int(self.ft_cfg.max_epochs)):
             self.current_epoch = epoch
+            self._print_epoch_header(epoch)
             train_metrics = self.train_one_epoch(epoch)
             results[f"train_epoch_{epoch}"] = train_metrics
+            self._print_metric_summary("train", train_metrics)
 
             val_metrics = {"loss": float("nan"), "psnr": float("nan"), "ssim": float("nan"), "nmse": float("nan")}
             if (
@@ -846,13 +993,19 @@ class FastMRIFineTuneTrainer:
             ):
                 val_metrics = self.evaluate_loader(self.val_loader, split="val")
                 results[f"val_epoch_{epoch}"] = val_metrics
+                self._print_metric_summary("val", val_metrics)
 
             self._save_checkpoint(last_ckpt_path, epoch=epoch, metrics=val_metrics)
+            self._console_print(f"[Checkpoint] Saved last checkpoint to {last_ckpt_path}")
             if val_metrics["psnr"] > self.best_val_psnr:
                 self.best_val_psnr = val_metrics["psnr"]
                 self._save_checkpoint(best_ckpt_path, epoch=epoch, metrics=val_metrics)
+                self._console_print(
+                    f"[Checkpoint] New best val PSNR {self._format_metric_value(self.best_val_psnr)} -> {best_ckpt_path}"
+                )
 
         if self.test_loader is not None:
             results["test"] = self.evaluate_loader(self.test_loader, split="test")
+            self._print_metric_summary("test", results["test"])
 
         return results

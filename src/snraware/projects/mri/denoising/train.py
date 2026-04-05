@@ -44,6 +44,14 @@ def _normalized_wandb_entity(entity: object) -> str | None:
     return text
 
 
+def _format_spatial_size(size: object) -> str:
+    if size is None:
+        return "unknown"
+    if isinstance(size, (list, tuple)) and len(size) >= 2:
+        return f"{int(size[0])}x{int(size[1])}"
+    return str(size)
+
+
 @hydra.main(version_base=None, config_path="./configs", config_name="fastmri_finetune")
 def run_fastmri_finetuning(config: DictConfig):
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -110,10 +118,20 @@ def run_fastmri_finetuning(config: DictConfig):
     crop_h, crop_w = [int(dim) for dim in config.fastmri_finetune.crop_size]
     train_patch_size = resolve_train_patch_size(config.fastmri_finetune)
     model_h, model_w = train_patch_size or (crop_h, crop_w)
+    eval_patch_overlap = config.get("overlap_for_inference", [0, 0, 0])
+    patch_inference_enabled = train_patch_size is not None and (model_h, model_w) != (crop_h, crop_w)
 
     print(
         f"{Fore.GREEN}Training precision: {precision_state['mode']} "
         f"(validation/test remain fp32).{Style.RESET_ALL}",
+        flush=True,
+    )
+    print(
+        f"{Fore.GREEN}FastMRI train input: {model_h}x{model_w} | "
+        f"eval crop: {crop_h}x{crop_w} | "
+        f"eval sliding-window: {'enabled' if patch_inference_enabled else 'disabled'} | "
+        f"eval patch/overlap: {_format_spatial_size(train_patch_size)} / "
+        f"{int(eval_patch_overlap[0])}x{int(eval_patch_overlap[1])}{Style.RESET_ALL}",
         flush=True,
     )
 
@@ -136,10 +154,39 @@ def run_fastmri_finetuning(config: DictConfig):
         f"{load_info['total_model_keys']} total model keys.{Style.RESET_ALL}",
         flush=True,
     )
+    native_spatial_size = load_info.get("native_spatial_size")
+    print(
+        f"{Fore.GREEN}Checkpoint native spatial size: {_format_spatial_size(native_spatial_size)} | "
+        f"current model spatial size: {_format_spatial_size(load_info.get('model_spatial_size'))} | "
+        f"full match: {'yes' if load_info['mismatched_keys'] == 0 else 'no'}{Style.RESET_ALL}",
+        flush=True,
+    )
+    if native_spatial_size is not None:
+        print(
+            f"{Fore.GREEN}Recommended native FastMRI patch size for this checkpoint: "
+            f"{_format_spatial_size(native_spatial_size)}.{Style.RESET_ALL}",
+            flush=True,
+        )
+    if load_info["mismatched_keys"] > 0:
+        mismatch_examples = ", ".join(load_info.get("mismatch_key_examples", [])[:5])
+        warning = (
+            "Partial pretrained load detected. This usually means the current spatial patch size "
+            "does not match the checkpoint's native size."
+        )
+        if native_spatial_size is not None:
+            warning += f" For the closest pretrained match, use TRAIN_PATCH_SIZE={_format_spatial_size(native_spatial_size)}."
+        print(f"{Fore.YELLOW}{warning}{Style.RESET_ALL}", flush=True)
+        if mismatch_examples:
+            print(
+                f"{Fore.YELLOW}Example mismatched keys: {mismatch_examples}{Style.RESET_ALL}",
+                flush=True,
+            )
     if wandb_run is not None:
         wandb_run.summary["base_weight_source"] = load_info["weight_source"]
         wandb_run.summary["base_matched_keys"] = load_info["matched_keys"]
         wandb_run.summary["base_mismatched_keys"] = load_info["mismatched_keys"]
+        wandb_run.summary["base_native_spatial_size"] = _format_spatial_size(native_spatial_size)
+        wandb_run.summary["model_spatial_size"] = _format_spatial_size(load_info.get("model_spatial_size"))
         wandb_run.summary["base_config_path"] = resolved_base_config_path
         wandb_run.summary["base_checkpoint_path"] = resolved_base_checkpoint_path
         wandb_run.summary["training_precision"] = precision_state["mode"]

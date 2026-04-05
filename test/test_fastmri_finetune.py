@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import sys
 import types
 from contextlib import contextmanager
@@ -864,14 +867,133 @@ def test_fastmri_config_defaults_to_small_base_model():
     assert config.base_model.config_path is None
     assert config.base_model.checkpoint_path is None
     assert config.fastmri_finetune.train_pre_post is False
-    assert config.fastmri_finetune.train_patch_size is None
+    assert list(config.fastmri_finetune.train_patch_size) == [64, 64]
 
 
 def test_run_fastmri_launcher_exposes_use_bf16():
     script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
 
-    assert 'USE_BF16="${USE_BF16:-true}"' in script
+    assert 'USE_BF16="$(normalize_bool "${USE_BF16:-true}")"' in script
     assert '"fastmri_finetune.use_bf16=${USE_BF16}"' in script
+
+
+def test_run_fastmri_launcher_exposes_patch_training_controls():
+    script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
+
+    assert 'TRAIN_PATCH_SIZE="${TRAIN_PATCH_SIZE:-64}"' in script
+    assert 'CROP_SIZE="${CROP_SIZE:-320}"' in script
+    assert 'PATCH_OVERLAP="${PATCH_OVERLAP:-16}"' in script
+    assert 'TRAIN_PRE_POST="$(normalize_bool "${TRAIN_PRE_POST:-false}")"' in script
+    assert 'GRADIENT_CHECKPOINT_FROZEN_BASE="$(normalize_bool "${GRADIENT_CHECKPOINT_FROZEN_BASE:-true}")"' in script
+    assert 'DRY_RUN="$(normalize_bool "${DRY_RUN:-false}")"' in script
+    assert '"fastmri_finetune.train_patch_size=${RESOLVED_TRAIN_PATCH_HYDRA}"' in script
+    assert '"fastmri_finetune.crop_size=${RESOLVED_CROP_HYDRA}"' in script
+    assert '"overlap_for_inference=${RESOLVED_PATCH_OVERLAP_HYDRA}"' in script
+    assert 'CHECKPOINT_NATIVE_SPATIAL_SIZE=' in script
+
+
+def test_run_fastmri_launcher_dry_run_defaults_to_native_patch_size(tmp_path: Path):
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed")
+
+    result = _run_fastmri_launcher_dry_run(tmp_path, use_preset_base_model=True)
+
+    assert result.returncode == 0, result.stderr
+    assert "TRAIN_INPUT_SIZE=64x64" in result.stdout
+    assert "EVAL_CROP_SIZE=320x320" in result.stdout
+    assert "CHECKPOINT_NATIVE_SPATIAL_SIZE=" in result.stdout
+    assert "Native pretrained spatial size is 64x64" in result.stdout
+    assert r"fastmri_finetune.train_patch_size=\[64\,64\]" in result.stdout
+
+
+def _run_fastmri_launcher_dry_run(
+    tmp_path: Path,
+    *,
+    use_preset_base_model: bool = False,
+    **env_overrides: str,
+):
+    script_path = Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh"
+    train_root = tmp_path / "train"
+    val_root = tmp_path / "val"
+    test_root = tmp_path / "test"
+    train_root.mkdir()
+    val_root.mkdir()
+    test_root.mkdir()
+
+    base_model_config = tmp_path / "base_model.yaml"
+    base_model_checkpoint = tmp_path / "base_model.pts"
+    base_model_config.write_text("dummy: true\n")
+    base_model_checkpoint.write_bytes(b"dummy")
+
+    env = {
+        **os.environ,
+        "DRY_RUN": "true",
+        "TRAIN_ROOT": str(train_root),
+        "VAL_ROOT": str(val_root),
+        "TEST_ROOT": str(test_root),
+        "DEVICE": "cpu",
+        "USE_WANDB": "false",
+    }
+    if not use_preset_base_model:
+        env["BASE_MODEL_CONFIG"] = str(base_model_config)
+        env["BASE_MODEL_CHECKPOINT"] = str(base_model_checkpoint)
+    env.update({key: str(value) for key, value in env_overrides.items()})
+
+    return subprocess.run(
+        ["bash", str(script_path)],
+        cwd=str(script_path.parent),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def test_run_fastmri_launcher_dry_run_emits_patch_overrides(tmp_path: Path):
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed")
+
+    result = _run_fastmri_launcher_dry_run(
+        tmp_path,
+        TRAIN_PATCH_SIZE="128",
+        CROP_SIZE="320",
+        PATCH_OVERLAP="16",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TRAIN_INPUT_SIZE=128x128" in result.stdout
+    assert "EVAL_CROP_SIZE=320x320" in result.stdout
+    assert "PATCH_INFERENCE_FOR_VAL_TEST=enabled" in result.stdout
+    assert r"fastmri_finetune.train_patch_size=\[128\,128\]" in result.stdout
+    assert r"fastmri_finetune.crop_size=\[320\,320\]" in result.stdout
+    assert r"overlap_for_inference=\[16\,16\,0\]" in result.stdout
+
+
+def test_run_fastmri_launcher_dry_run_can_disable_patch_mode(tmp_path: Path):
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed")
+
+    result = _run_fastmri_launcher_dry_run(tmp_path, TRAIN_PATCH_SIZE="null")
+
+    assert result.returncode == 0, result.stderr
+    assert "TRAIN_INPUT_SIZE=320x320" in result.stdout
+    assert "PATCH_INFERENCE_FOR_VAL_TEST=disabled" in result.stdout
+    assert "fastmri_finetune.train_patch_size=null" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"MODE": "bad_mode"}, "Unsupported MODE"),
+        ({"TRAIN_PATCH_SIZE": "400x400"}, "TRAIN_PATCH_SIZE must fit inside CROP_SIZE"),
+        ({"PATCH_OVERLAP": "128"}, "PATCH_OVERLAP must be smaller than TRAIN_PATCH_SIZE"),
+    ],
+)
+def test_run_fastmri_launcher_rejects_invalid_patch_or_mode(tmp_path: Path, overrides: dict[str, str], message: str):
+    result = _run_fastmri_launcher_dry_run(tmp_path, **overrides)
+
+    assert result.returncode != 0
+    assert message in result.stderr
 
 
 def test_fastmri_train_entrypoint_builds_model_at_train_patch_size(monkeypatch, tmp_path: Path):
@@ -950,6 +1072,86 @@ def test_fastmri_train_entrypoint_builds_model_at_train_patch_size(monkeypatch, 
     assert build_calls["width"] == 128
     assert trainer_kwargs["train_loader"] == "train_loader"
     assert trainer_kwargs["val_loader"] == "val_loader"
+
+
+def test_fastmri_train_entrypoint_prints_native_size_and_partial_load_warning(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    with initialize(version_base=None, config_path="../src/snraware/projects/mri/denoising/configs"):
+        config = compose(config_name="fastmri_finetune")
+
+    config.logging.use_wandb = False
+    config.fastmri_finetune.train_root = "/tmp/train"
+    config.fastmri_finetune.val_root = None
+    config.fastmri_finetune.test_root = None
+    config.fastmri_finetune.save_root = str(tmp_path)
+    config.fastmri_finetune.device = "cpu"
+    config.fastmri_finetune.use_bf16 = False
+    config.fastmri_finetune.train_patch_size = [128, 128]
+    config.fastmri_finetune.crop_size = [320, 320]
+
+    fake_fastmri = types.ModuleType("fastmri")
+    fake_fastmri_evaluate = types.ModuleType("fastmri.evaluate")
+    fake_fastmri_evaluate.nmse = lambda *args, **kwargs: 0.0
+    monkeypatch.setitem(sys.modules, "fastmri", fake_fastmri)
+    monkeypatch.setitem(sys.modules, "fastmri.evaluate", fake_fastmri_evaluate)
+
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "resolve_base_model_paths",
+        lambda **kwargs: ("./cfg.yaml", "./weights.pts"),
+    )
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "build_fastmri_dataloaders",
+        lambda config: ("train_loader", None, None),
+    )
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "_resolve_device",
+        lambda device_str: torch.device("cpu"),
+    )
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "resolve_fastmri_precision",
+        lambda device, use_bf16: {"mode": "fp32", "use_bf16": False},
+    )
+    monkeypatch.setattr(fastmri_train_module, "seed_everything", lambda seed: None)
+
+    monkeypatch.setattr(
+        fastmri_train_module,
+        "build_fastmri_wrapped_model",
+        lambda **kwargs: (
+            torch.nn.Identity(),
+            OmegaConf.create({}),
+            {
+                "weight_source": "jit",
+                "matched_keys": 218,
+                "mismatched_keys": 70,
+                "total_model_keys": 288,
+                "native_spatial_size": [64, 64],
+                "model_spatial_size": [128, 128],
+                "mismatch_key_examples": ["bk.B00.block.cell_0.n1.ln.weight"],
+            },
+        ),
+    )
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            pass
+
+        def train(self):
+            return {}
+
+    monkeypatch.setattr(fastmri_train_module, "FastMRIFineTuneTrainer", FakeTrainer)
+
+    fastmri_train_module.run_fastmri_finetuning.__wrapped__(config)
+
+    captured = capsys.readouterr()
+    assert "FastMRI train input: 128x128 | eval crop: 320x320 | eval sliding-window: enabled" in captured.out
+    assert "Checkpoint native spatial size: 64x64 | current model spatial size: 128x128 | full match: no" in captured.out
+    assert "Partial pretrained load detected." in captured.out
+    assert "Example mismatched keys: bk.B00.block.cell_0.n1.ln.weight" in captured.out
 
 
 def test_run_fastmri_launcher_supports_model_size_presets():
@@ -1441,6 +1643,43 @@ def test_fastmri_trainer_eval_uses_patch_inference_for_full_resolution_metrics(m
     assert patch_calls == [(1, 2, 64, 64), (1, 2, 64, 64)]
     assert set(metrics) == {"loss", "psnr", "ssim", "nmse"}
     assert all(np.isfinite(value) for value in metrics.values())
+
+
+def test_fastmri_trainer_prints_console_progress_summaries(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.max_epochs = 1
+    config.fastmri_finetune.log_every_n_steps = 1
+    config.fastmri_finetune.evaluate_every_n_epochs = 1
+
+    metric_fns = {
+        "psnr": lambda gt, pred: float(-np.mean((gt - pred) ** 2)),
+        "ssim": lambda gt, pred: float(1.0 / (1.0 + np.mean((gt - pred) ** 2))),
+        "nmse": lambda gt, pred: float(np.sum((gt - pred) ** 2) / max(np.sum(gt**2), 1e-12)),
+    }
+
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    val_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_only"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "console_progress",
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=None,
+        metric_fns=metric_fns,
+    )
+
+    trainer.train()
+
+    captured = capsys.readouterr()
+    assert "[FastMRI trainer]" in captured.out
+    assert "[Epoch 1/1]" in captured.out
+    assert "[Train step 1/2]" in captured.out
+    assert "[Train]" in captured.out
+    assert "[Val]" in captured.out
+    assert "[Checkpoint] Saved last checkpoint" in captured.out
 
 
 def test_fastmri_trainer_train_uses_bf16_context_but_loss_stays_fp32(monkeypatch, tmp_path: Path):

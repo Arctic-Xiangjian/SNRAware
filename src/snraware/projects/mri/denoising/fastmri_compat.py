@@ -364,7 +364,7 @@ def _strip_known_prefixes(
 
 def _best_shape_compatible_state(
     model: nn.Module, raw_state: dict[str, torch.Tensor]
-) -> tuple[dict[str, torch.Tensor], int, int]:
+) -> tuple[dict[str, torch.Tensor], int, int, list[str]]:
     model_state = model.state_dict()
     candidates = [
         raw_state,
@@ -378,35 +378,39 @@ def _best_shape_compatible_state(
     best_filtered: dict[str, torch.Tensor] = {}
     best_match = -1
     best_mismatch = math.inf
+    best_mismatch_keys: list[str] = []
     for candidate in candidates:
         filtered = {}
         mismatched_shapes = 0
+        mismatch_keys: list[str] = []
         for key, value in candidate.items():
             if key in model_state:
                 if model_state[key].shape == value.shape:
                     filtered[key] = value
                 else:
                     mismatched_shapes += 1
+                    mismatch_keys.append(key)
         if len(filtered) > best_match or (
             len(filtered) == best_match and mismatched_shapes < best_mismatch
         ):
             best_filtered = filtered
             best_match = len(filtered)
             best_mismatch = mismatched_shapes
+            best_mismatch_keys = mismatch_keys
 
-    return best_filtered, int(best_match), int(best_mismatch)
+    return best_filtered, int(best_match), int(best_mismatch), best_mismatch_keys
 
 
 def load_pretrained_base_weights(
     model: nn.Module, weight_path: str | Path
-) -> tuple[int, int, int, str]:
+) -> tuple[int, int, int, str, list[str]]:
     """Load the best shape-compatible weights from a checkpoint into a base model."""
     raw_state, source = _load_raw_state_dict(weight_path)
-    filtered, matched, mismatched = _best_shape_compatible_state(model, raw_state)
+    filtered, matched, mismatched, mismatch_keys = _best_shape_compatible_state(model, raw_state)
     if matched <= 0:
         raise RuntimeError(f"No compatible weights matched the current model from {weight_path}")
     model.load_state_dict(filtered, strict=False)
-    return matched, mismatched, len(model.state_dict()), source
+    return matched, mismatched, len(model.state_dict()), source, mismatch_keys
 
 
 def has_lora_adapters(model: nn.Module) -> bool:
@@ -543,6 +547,10 @@ def build_fastmri_wrapped_model(
 ) -> tuple[SNRAwareWithGFactor, DictConfig, dict[str, Any]]:
     """Build a FastMRI fine-tune model from a base SNRAware checkpoint."""
     config = load_model_config_with_legacy_fixes(base_config_path)
+    native_cutout_shape = OmegaConf.select(config, "dataset.cutout_shape")
+    native_spatial_size = None
+    if native_cutout_shape is not None and len(native_cutout_shape) >= 2:
+        native_spatial_size = [int(native_cutout_shape[0]), int(native_cutout_shape[1])]
     if OmegaConf.select(config, "dataset") is None:
         config.dataset = OmegaConf.create({})
     config.dataset.cutout_shape = [height, width, depth]
@@ -552,7 +560,9 @@ def build_fastmri_wrapped_model(
         )
 
     base_model = DenoisingModel(config=config, D=depth, H=height, W=width)
-    matched, mismatched, total, source = load_pretrained_base_weights(base_model, base_checkpoint_path)
+    matched, mismatched, total, source, mismatch_keys = load_pretrained_base_weights(
+        base_model, base_checkpoint_path
+    )
     wrapped_model = SNRAwareWithGFactor(
         base_model=base_model,
         gfactor_unet=NormUnet(**(gfactor_unet_kwargs or {})),
@@ -563,5 +573,8 @@ def build_fastmri_wrapped_model(
         "mismatched_keys": mismatched,
         "total_model_keys": total,
         "weight_source": source,
+        "mismatch_key_examples": mismatch_keys[:10],
+        "native_spatial_size": native_spatial_size,
+        "model_spatial_size": [int(height), int(width)],
     }
     return wrapped_model, config, load_info
