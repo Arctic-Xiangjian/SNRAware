@@ -25,6 +25,7 @@ from snraware.projects.mri.denoising.base_model_resolver import (
     resolve_base_model_paths,
 )
 from snraware.projects.mri.denoising.fastmri_compat import (
+    NormUnet,
     SNRAwareWithGFactor,
     is_fastmri_finetune_checkpoint,
     load_fastmri_finetune_checkpoint,
@@ -73,6 +74,7 @@ def _tiny_config(mode: str):
             "warmup_epochs": 1,
             "unet_lr": 1e-3,
             "adapter_lr": 1e-3,
+            "gradient_clip_val": 1.0,
             "weight_decay": 0.0,
             "scheduler_t_max": 0,
             "resume_from": None,
@@ -129,6 +131,31 @@ class ToyFastMRIDataset(Dataset):
             "name": f"{self.volume_names[index]}_slice_{index}",
             "volume_name": self.volume_names[index],
             "slice_idx": index % 2,
+            "mean": torch.tensor(0.0, dtype=torch.float32),
+            "std": torch.tensor(1.0, dtype=torch.float32),
+            "mask": torch.ones(self.size, self.size, 2, dtype=torch.float32),
+            "masked_kspace": torch.zeros(self.size, self.size, 2, dtype=torch.float32),
+        }
+        return self.noisy[index], self.clean[index], torch.tensor(0.0), metadata
+
+
+class FlatFastMRIDataset(Dataset):
+    def __init__(self, num_samples: int, *, size: int = 64, fill_value: float = 0.0):
+        super().__init__()
+        self.size = size
+        self.noisy = torch.full((num_samples, 2, size, size), fill_value, dtype=torch.float32)
+        self.clean = torch.sqrt(
+            self.noisy[:, 0:1, ...].square() + self.noisy[:, 1:2, ...].square()
+        )
+
+    def __len__(self) -> int:
+        return len(self.noisy)
+
+    def __getitem__(self, index: int):
+        metadata = {
+            "name": f"flat_volume_0_slice_{index}",
+            "volume_name": "flat_volume_0",
+            "slice_idx": index,
             "mean": torch.tensor(0.0, dtype=torch.float32),
             "std": torch.tensor(1.0, dtype=torch.float32),
             "mask": torch.ones(self.size, self.size, 2, dtype=torch.float32),
@@ -249,6 +276,21 @@ def test_wrapper_bypasses_gfactor_for_native_3ch_input():
     assert gfactor.calls == 0
     assert output.shape == (2, 2, 1, 8, 8)
     assert torch.equal(base_model.last_input, noisy)
+
+
+@pytest.mark.parametrize(
+    ("name", "input_tensor"),
+    [
+        ("zeros", torch.zeros(1, 1, 64, 64, 2, dtype=torch.float32)),
+        ("constant", torch.ones(1, 1, 64, 64, 2, dtype=torch.float32)),
+        ("tiny_variance", torch.randn(1, 1, 64, 64, 2, dtype=torch.float32) * 1e-8),
+    ],
+)
+def test_normunet_adapter_remains_finite_on_low_variance_inputs(name: str, input_tensor: torch.Tensor):
+    model = NormUnet()
+    output = model(input_tensor)
+    assert output.shape == (1, 1, 64, 64), name
+    assert torch.isfinite(output).all(), name
 
 
 def test_complex_output_to_magnitude_uses_exact_formula_without_epsilon():
@@ -1612,6 +1654,35 @@ def test_fastmri_trainer_smoke_step(mode: str, tmp_path: Path):
     assert all(np.isfinite(value) for value in val_metrics.values())
 
 
+def test_fastmri_trainer_smoke_step_stays_finite_on_zero_background_patches(tmp_path: Path):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.max_epochs = 1
+    config.fastmri_finetune.log_every_n_steps = 100
+    config.fastmri_finetune.evaluate_every_n_epochs = 1
+    config.fastmri_finetune.unet_lr = 1e-3
+    config.fastmri_finetune.scheduler_t_max = 0
+
+    train_loader = DataLoader(FlatFastMRIDataset(4, size=64, fill_value=0.0), batch_size=2, shuffle=False)
+    model = _build_wrapped_model("unet_only", size=64)
+    trainer = FastMRIFineTuneTrainer(
+        model=model,
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "zero_background",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    train_metrics = trainer.train_one_epoch(0)
+
+    assert "loss" in train_metrics
+    assert np.isfinite(train_metrics["loss"])
+    assert train_metrics["num_skipped_nonfinite_steps"] == 0
+    assert np.isfinite(train_metrics["mean_grad_norm_gfactor_unet"])
+    assert np.isfinite(train_metrics["mean_gfactor_mean"])
+
+
 def test_fastmri_trainer_eval_uses_patch_inference_for_full_resolution_metrics(monkeypatch, tmp_path: Path):
     config = _tiny_config("unet_only")
     config.fastmri_finetune.train_patch_size = [32, 32]
@@ -1649,6 +1720,44 @@ def test_fastmri_trainer_eval_uses_patch_inference_for_full_resolution_metrics(m
     assert patch_calls == [(1, 2, 64, 64), (1, 2, 64, 64)]
     assert set(metrics) == {"loss", "psnr", "ssim", "nmse"}
     assert all(np.isfinite(value) for value in metrics.values())
+
+
+def test_fastmri_warmup_keeps_base_model_in_eval_mode_until_adapters_activate(monkeypatch, tmp_path: Path):
+    config = _tiny_config("warmup_then_both")
+    config.fastmri_finetune.warmup_epochs = 1
+    train_loader = DataLoader(ToyFastMRIDataset(2, size=32), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("warmup_then_both", size=32),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "warmup_base_eval",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    original_forward = trainer.model.base_model.forward
+    epoch0_flags: list[bool] = []
+    epoch1_flags: list[bool] = []
+
+    def wrapped_forward_epoch0(x: torch.Tensor):
+        epoch0_flags.append(trainer.model.base_model.training)
+        return original_forward(x)
+
+    monkeypatch.setattr(trainer.model.base_model, "forward", wrapped_forward_epoch0)
+    trainer.train_one_epoch(0)
+
+    def wrapped_forward_epoch1(x: torch.Tensor):
+        epoch1_flags.append(trainer.model.base_model.training)
+        return original_forward(x)
+
+    monkeypatch.setattr(trainer.model.base_model, "forward", wrapped_forward_epoch1)
+    trainer.train_one_epoch(1)
+
+    assert epoch0_flags
+    assert all(flag is False for flag in epoch0_flags)
+    assert epoch1_flags
+    assert all(flag is True for flag in epoch1_flags)
 
 
 def test_fastmri_eval_uses_inference_mode_and_eval_flag(monkeypatch, tmp_path: Path):
@@ -1689,6 +1798,45 @@ def test_fastmri_eval_uses_inference_mode_and_eval_flag(monkeypatch, tmp_path: P
     assert flags
     assert all(training_flag is False for training_flag, _ in flags)
     assert all(inference_flag is True for _, inference_flag in flags)
+
+
+def test_fastmri_trainer_skips_nonfinite_steps_without_updating_optimizer(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.log_every_n_steps = 1
+
+    train_loader = DataLoader(ToyFastMRIDataset(2, size=32), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_only", size=32),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "skip_nonfinite",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    original_forward = trainer.model.forward
+    call_state = {"count": 0}
+
+    def wrapped_forward(x: torch.Tensor, **kwargs):
+        call_state["count"] += 1
+        if call_state["count"] == 1:
+            return torch.full((x.shape[0], 2, 1, x.shape[-2], x.shape[-1]), float("nan"), dtype=torch.float32)
+        return original_forward(x, **kwargs)
+
+    monkeypatch.setattr(trainer.model, "forward", wrapped_forward)
+
+    train_metrics = trainer.train_one_epoch(0)
+
+    captured = capsys.readouterr()
+    assert train_metrics["num_skipped_nonfinite_steps"] == 1
+    assert np.isfinite(train_metrics["loss"])
+    assert "[Train skip 1/2]" in captured.out
+    assert "reason=nonfinite_output" in captured.out
 
 
 def test_fastmri_eval_patch_inference_uses_eval_patch_batch_size(monkeypatch, tmp_path: Path):
@@ -1765,6 +1913,9 @@ def test_fastmri_trainer_prints_console_progress_summaries(tmp_path: Path, capsy
     assert "[Train]" in captured.out
     assert "[Val]" in captured.out
     assert "[Checkpoint] Saved last checkpoint" in captured.out
+    assert "gfactor_max=" in captured.out
+    assert "grad_unet=" in captured.out
+    assert "skipped_nonfinite_steps=0" in captured.out
 
 
 def test_fastmri_trainer_train_uses_bf16_context_but_loss_stays_fp32(monkeypatch, tmp_path: Path):

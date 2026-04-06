@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import sys
 import time
+import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
@@ -494,6 +495,7 @@ class FastMRIFineTuneTrainer:
         self.gradient_checkpoint_frozen_base = bool(
             self.ft_cfg.get("gradient_checkpoint_frozen_base", True)
         )
+        self.gradient_clip_val = float(self.ft_cfg.get("gradient_clip_val", 1.0))
         self.train_patch_size = resolve_train_patch_size(self.ft_cfg)
         self.eval_patch_batch_size = max(1, int(self.ft_cfg.get("eval_patch_batch_size", 64)))
         self.eval_patch_overlap = (
@@ -641,6 +643,102 @@ class FastMRIFineTuneTrainer:
                 return float(group["lr"])
         return None
 
+    @staticmethod
+    def _format_stat_value(value: float | None) -> str:
+        if value is None or not np.isfinite(value):
+            return "nan"
+        return f"{float(value):.4f}"
+
+    def _should_keep_base_model_in_eval_mode(self) -> bool:
+        return self.ft_cfg.mode == "unet_only" or (
+            self.ft_cfg.mode == "warmup_then_both" and not self.mode_state["adapters_active"]
+        )
+
+    def _apply_training_modes(self) -> None:
+        self.model.train()
+        if self._should_keep_base_model_in_eval_mode():
+            self.model.base_model.eval()
+
+    @staticmethod
+    def _tensor_is_finite(value: torch.Tensor) -> bool:
+        return bool(torch.isfinite(value).all().item())
+
+    def _collect_group_grad_norms(self) -> tuple[dict[str, float], bool]:
+        norms: dict[str, float] = {}
+        has_nonfinite = False
+        for group in self.optimizer.param_groups:
+            sq_sum = 0.0
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                grad = parameter.grad.detach().float()
+                if not torch.isfinite(grad).all():
+                    has_nonfinite = True
+                    continue
+                grad_norm = float(torch.linalg.vector_norm(grad).item())
+                if not np.isfinite(grad_norm):
+                    has_nonfinite = True
+                    continue
+                sq_sum += grad_norm**2
+            norms[str(group.get("name", "group"))] = math.sqrt(sq_sum)
+        return norms, has_nonfinite
+
+    def _clip_gradients(self) -> float | None:
+        if self.gradient_clip_val <= 0:
+            return None
+
+        parameters: list[torch.nn.Parameter] = []
+        seen: set[int] = set()
+        for group in self.optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is None or id(parameter) in seen:
+                    continue
+                parameters.append(parameter)
+                seen.add(id(parameter))
+
+        if not parameters:
+            return None
+
+        total_grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm=self.gradient_clip_val)
+        return float(total_grad_norm.item())
+
+    def _last_gfactor_stats(self) -> dict[str, float]:
+        stats = getattr(self.model, "last_gfactor_stats", None)
+        if not stats:
+            return {"mean": float("nan"), "p95": float("nan"), "max": float("nan")}
+        return {
+            "mean": float(stats.get("mean", float("nan"))),
+            "p95": float(stats.get("p95", float("nan"))),
+            "max": float(stats.get("max", float("nan"))),
+        }
+
+    def _report_nonfinite_step(
+        self,
+        *,
+        epoch: int,
+        step_idx: int,
+        reason: str,
+        checkpoint_frozen_base: bool,
+        gfactor_stats: dict[str, float] | None = None,
+        grad_norms: dict[str, float] | None = None,
+    ) -> None:
+        gfactor_stats = gfactor_stats or {}
+        grad_norms = grad_norms or {}
+        self._console_print(
+            "[Train skip "
+            f"{step_idx + 1}/{len(self.train_loader)}] "
+            f"epoch={epoch + 1} | "
+            f"reason={reason} | "
+            f"precision={self.precision_mode} | "
+            f"adapters_active={self.mode_state['adapters_active']} | "
+            f"checkpoint_base_model={checkpoint_frozen_base} | "
+            f"gfactor_mean={self._format_stat_value(gfactor_stats.get('mean'))} | "
+            f"gfactor_p95={self._format_stat_value(gfactor_stats.get('p95'))} | "
+            f"gfactor_max={self._format_stat_value(gfactor_stats.get('max'))} | "
+            f"grad_unet={self._format_stat_value(grad_norms.get('gfactor_unet'))} | "
+            f"grad_adapter={self._format_stat_value(grad_norms.get('adapter'))}"
+        )
+
     def _print_startup_summary(self) -> None:
         crop_size_cfg = self.ft_cfg.get("crop_size", None)
         eval_crop_size = (
@@ -665,7 +763,9 @@ class FastMRIFineTuneTrainer:
             f"eval_patch_inference={'yes' if patch_inference_enabled else 'no'} | "
             f"eval_patch_batch_size={self.eval_patch_batch_size} | "
             f"eval_patch_overlap={overlap_text} | "
-            f"checkpoint_base_model={'yes' if self.gradient_checkpoint_frozen_base else 'no'}"
+            f"checkpoint_base_model={'yes' if self.gradient_checkpoint_frozen_base else 'no'} | "
+            f"frozen_base_eval={'yes' if self._should_keep_base_model_in_eval_mode() else 'no'} | "
+            f"grad_clip={self._format_stat_value(self.gradient_clip_val)}"
         )
 
     def _print_epoch_header(self, epoch: int) -> None:
@@ -675,6 +775,7 @@ class FastMRIFineTuneTrainer:
             f"mode={self.ft_cfg.mode} | "
             f"adapters_active={self.mode_state['adapters_active']} | "
             f"checkpoint_base_model={self._should_checkpoint_frozen_base()} | "
+            f"frozen_base_eval={self._should_keep_base_model_in_eval_mode()} | "
             f"lr_unet={self._format_lr(self._current_group_lr('gfactor_unet'))} | "
             f"lr_adapter={self._format_lr(self._current_group_lr('adapter'))}"
         )
@@ -683,7 +784,15 @@ class FastMRIFineTuneTrainer:
         if split == "train":
             self._console_print(
                 "[Train] "
-                f"loss={self._format_metric_value(metrics['loss'])}"
+                f"loss={self._format_metric_value(metrics['loss'])} | "
+                f"skipped_nonfinite_steps={int(metrics.get('num_skipped_nonfinite_steps', 0))} | "
+                f"grad_unet_mean={self._format_stat_value(metrics.get('mean_grad_norm_gfactor_unet'))} | "
+                f"grad_unet_max={self._format_stat_value(metrics.get('max_grad_norm_gfactor_unet'))} | "
+                f"grad_adapter_mean={self._format_stat_value(metrics.get('mean_grad_norm_adapter'))} | "
+                f"grad_adapter_max={self._format_stat_value(metrics.get('max_grad_norm_adapter'))} | "
+                f"gfactor_mean={self._format_stat_value(metrics.get('mean_gfactor_mean'))} | "
+                f"gfactor_p95={self._format_stat_value(metrics.get('mean_gfactor_p95'))} | "
+                f"gfactor_max={self._format_stat_value(metrics.get('max_gfactor_max'))}"
             )
             return
 
@@ -812,12 +921,17 @@ class FastMRIFineTuneTrainer:
 
     def train_one_epoch(self, epoch: int) -> dict[str, float]:
         self._maybe_activate_adapters(epoch)
-        self.model.train()
+        self._apply_training_modes()
         checkpoint_frozen_base = self._should_checkpoint_frozen_base()
 
         loss_sum = 0.0
         step_count = 0
         step_start = time.time()
+        skipped_nonfinite_steps = 0
+        grad_norm_sums = defaultdict(float)
+        grad_norm_max = defaultdict(float)
+        gfactor_stat_sums = defaultdict(float)
+        gfactor_max = float("nan")
 
         progress = tqdm(
             self.train_loader,
@@ -836,14 +950,93 @@ class FastMRIFineTuneTrainer:
             with self._autocast_context(enabled=self.use_bf16):
                 output = self.model(noisy, checkpoint_base_model=checkpoint_frozen_base)
                 magnitude_output = complex_output_to_magnitude(output)
+            gfactor_stats = self._last_gfactor_stats()
+            if not self._tensor_is_finite(output):
+                skipped_nonfinite_steps += 1
+                self._report_nonfinite_step(
+                    epoch=epoch,
+                    step_idx=step_idx,
+                    reason="nonfinite_output",
+                    checkpoint_frozen_base=checkpoint_frozen_base,
+                    gfactor_stats=gfactor_stats,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
             magnitude_output = magnitude_output.float()
+            if not self._tensor_is_finite(magnitude_output):
+                skipped_nonfinite_steps += 1
+                self._report_nonfinite_step(
+                    epoch=epoch,
+                    step_idx=step_idx,
+                    reason="nonfinite_magnitude",
+                    checkpoint_frozen_base=checkpoint_frozen_base,
+                    gfactor_stats=gfactor_stats,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
             loss = self.loss_fn(magnitude_output, clean)
+            if not self._tensor_is_finite(loss):
+                skipped_nonfinite_steps += 1
+                self._report_nonfinite_step(
+                    epoch=epoch,
+                    step_idx=step_idx,
+                    reason="nonfinite_loss",
+                    checkpoint_frozen_base=checkpoint_frozen_base,
+                    gfactor_stats=gfactor_stats,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
 
             loss.backward()
+            grad_norms, has_nonfinite_gradients = self._collect_group_grad_norms()
+            if has_nonfinite_gradients:
+                skipped_nonfinite_steps += 1
+                self._report_nonfinite_step(
+                    epoch=epoch,
+                    step_idx=step_idx,
+                    reason="nonfinite_gradients",
+                    checkpoint_frozen_base=checkpoint_frozen_base,
+                    gfactor_stats=gfactor_stats,
+                    grad_norms=grad_norms,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
+            total_grad_norm = self._clip_gradients()
+            if total_grad_norm is not None and not np.isfinite(total_grad_norm):
+                skipped_nonfinite_steps += 1
+                self._report_nonfinite_step(
+                    epoch=epoch,
+                    step_idx=step_idx,
+                    reason="nonfinite_total_grad_norm",
+                    checkpoint_frozen_base=checkpoint_frozen_base,
+                    gfactor_stats=gfactor_stats,
+                    grad_norms=grad_norms,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
             self.optimizer.step()
 
             loss_sum += float(loss.item())
             step_count += 1
+            grad_norm_sums["gfactor_unet"] += float(grad_norms.get("gfactor_unet", 0.0))
+            grad_norm_sums["adapter"] += float(grad_norms.get("adapter", 0.0))
+            grad_norm_max["gfactor_unet"] = max(
+                grad_norm_max["gfactor_unet"],
+                float(grad_norms.get("gfactor_unet", 0.0)),
+            )
+            grad_norm_max["adapter"] = max(
+                grad_norm_max["adapter"],
+                float(grad_norms.get("adapter", 0.0)),
+            )
+            gfactor_stat_sums["mean"] += float(gfactor_stats.get("mean", float("nan")))
+            gfactor_stat_sums["p95"] += float(gfactor_stats.get("p95", float("nan")))
+            gfactor_stat_sums["max"] += float(gfactor_stats.get("max", float("nan")))
+            gfactor_max = (
+                float(gfactor_stats.get("max", float("nan")))
+                if not np.isfinite(gfactor_max)
+                else max(gfactor_max, float(gfactor_stats.get("max", float("nan"))))
+            )
 
             mean_loss = loss_sum / max(step_count, 1)
             if self._use_tqdm:
@@ -855,6 +1048,9 @@ class FastMRIFineTuneTrainer:
                     prec=self.precision_mode,
                     adapters="on" if self.mode_state["adapters_active"] else "off",
                     ckpt="on" if checkpoint_frozen_base else "off",
+                    gmax=self._format_stat_value(gfactor_stats.get("max")),
+                    gn_u=self._format_stat_value(grad_norms.get("gfactor_unet")),
+                    skip=str(skipped_nonfinite_steps),
                 )
 
             if (step_idx + 1) % int(self.ft_cfg.log_every_n_steps) == 0:
@@ -864,6 +1060,15 @@ class FastMRIFineTuneTrainer:
                         "train/loss": mean_loss,
                         "train/epoch": epoch,
                         "train/steps_per_sec": step_count / max(elapsed, 1e-12),
+                        "train/num_skipped_nonfinite_steps": skipped_nonfinite_steps,
+                        "train/grad_norm_gfactor_unet": float(grad_norms.get("gfactor_unet", 0.0)),
+                        "train/grad_norm_adapter": float(grad_norms.get("adapter", 0.0)),
+                        "train/total_grad_norm": (
+                            float(total_grad_norm) if total_grad_norm is not None else float("nan")
+                        ),
+                        "train/gfactor_mean": float(gfactor_stats.get("mean", float("nan"))),
+                        "train/gfactor_p95": float(gfactor_stats.get("p95", float("nan"))),
+                        "train/gfactor_max": float(gfactor_stats.get("max", float("nan"))),
                     }
                 )
                 if not self._use_tqdm:
@@ -876,7 +1081,13 @@ class FastMRIFineTuneTrainer:
                         f"lr_adapter={self._format_lr(self._current_group_lr('adapter'))} | "
                         f"precision={self.precision_mode} | "
                         f"adapters_active={self.mode_state['adapters_active']} | "
-                        f"checkpoint_base_model={checkpoint_frozen_base}"
+                        f"checkpoint_base_model={checkpoint_frozen_base} | "
+                        f"grad_unet={self._format_stat_value(grad_norms.get('gfactor_unet'))} | "
+                        f"grad_adapter={self._format_stat_value(grad_norms.get('adapter'))} | "
+                        f"gfactor_mean={self._format_stat_value(gfactor_stats.get('mean'))} | "
+                        f"gfactor_p95={self._format_stat_value(gfactor_stats.get('p95'))} | "
+                        f"gfactor_max={self._format_stat_value(gfactor_stats.get('max'))} | "
+                        f"skipped_nonfinite_steps={skipped_nonfinite_steps}"
                     )
 
         if self._use_tqdm:
@@ -885,8 +1096,35 @@ class FastMRIFineTuneTrainer:
         if self.scheduler is not None:
             self.scheduler.step()
 
-        train_metrics = {"loss": loss_sum / max(step_count, 1)}
-        self._log({"train/loss_epoch": train_metrics["loss"], "epoch": epoch})
+        train_metrics = {
+            "loss": (loss_sum / max(step_count, 1)) if step_count > 0 else float("nan"),
+            "num_skipped_nonfinite_steps": skipped_nonfinite_steps,
+            "mean_grad_norm_gfactor_unet": (
+                grad_norm_sums["gfactor_unet"] / step_count if step_count > 0 else float("nan")
+            ),
+            "max_grad_norm_gfactor_unet": grad_norm_max["gfactor_unet"],
+            "mean_grad_norm_adapter": (
+                grad_norm_sums["adapter"] / step_count if step_count > 0 else float("nan")
+            ),
+            "max_grad_norm_adapter": grad_norm_max["adapter"],
+            "mean_gfactor_mean": gfactor_stat_sums["mean"] / step_count if step_count > 0 else float("nan"),
+            "mean_gfactor_p95": gfactor_stat_sums["p95"] / step_count if step_count > 0 else float("nan"),
+            "max_gfactor_max": gfactor_max,
+        }
+        self._log(
+            {
+                "train/loss_epoch": train_metrics["loss"],
+                "train/num_skipped_nonfinite_steps_epoch": skipped_nonfinite_steps,
+                "train/mean_grad_norm_gfactor_unet": train_metrics["mean_grad_norm_gfactor_unet"],
+                "train/max_grad_norm_gfactor_unet": train_metrics["max_grad_norm_gfactor_unet"],
+                "train/mean_grad_norm_adapter": train_metrics["mean_grad_norm_adapter"],
+                "train/max_grad_norm_adapter": train_metrics["max_grad_norm_adapter"],
+                "train/mean_gfactor_mean": train_metrics["mean_gfactor_mean"],
+                "train/mean_gfactor_p95": train_metrics["mean_gfactor_p95"],
+                "train/max_gfactor_max": train_metrics["max_gfactor_max"],
+                "epoch": epoch,
+            }
+        )
         return train_metrics
 
     def evaluate_loader(self, loader: DataLoader | None, *, split: str) -> dict[str, float]:

@@ -145,7 +145,7 @@ class Unet2D(nn.Module):
 
 
 class NormUnet(nn.Module):
-    """FastMRI-style normalized U-Net adapted for real-valued g-factor prediction.
+    """FastMRI-style U-Net adapted for real-valued g-factor prediction.
 
     Input is expected in complex-last format: ``[B, C, H, W, 2]``.
     Output is a real-valued tensor of shape ``[B, out_chans, H, W]``.
@@ -212,7 +212,9 @@ class NormUnet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.complex_to_chan_dim(x)
-        x, _mean, _std = self.norm(x)
+        # FastMRI samples are already normalized in the dataset. Avoid a second
+        # per-sample std normalization here so low-variance background patches
+        # do not divide by zero and produce NaNs during warmup training.
         x, pad_sizes = self.pad(x)
         x = self.unet(x)
         return self.unpad(x, pad_sizes)
@@ -226,6 +228,7 @@ class SNRAwareWithGFactor(nn.Module):
         self.base_model = base_model
         self.gfactor_unet = gfactor_unet or NormUnet()
         self.config = getattr(base_model, "config", None)
+        self.last_gfactor_stats: dict[str, float] | None = None
 
     @property
     def device(self) -> torch.device:
@@ -249,6 +252,18 @@ class SNRAwareWithGFactor(nn.Module):
         gfactor = torch.abs(self.gfactor_unet(complex_last))
         return gfactor
 
+    def _record_gfactor_stats(self, gfactor: torch.Tensor) -> None:
+        flat = gfactor.detach().float().reshape(-1)
+        finite = flat[torch.isfinite(flat)]
+        if finite.numel() == 0:
+            self.last_gfactor_stats = {"mean": float("nan"), "p95": float("nan"), "max": float("nan")}
+            return
+        self.last_gfactor_stats = {
+            "mean": float(finite.mean().item()),
+            "p95": float(torch.quantile(finite, 0.95).item()),
+            "max": float(finite.max().item()),
+        }
+
     def _forward_base_model(
         self,
         x_with_gfactor: torch.Tensor,
@@ -271,6 +286,7 @@ class SNRAwareWithGFactor(nn.Module):
     ) -> torch.Tensor:
         x = self._prepare_2ch_input(x)
         gfactor = self.predict_gfactor(x).unsqueeze(2)
+        self._record_gfactor_stats(gfactor)
         x_with_gfactor = torch.cat([x, gfactor], dim=1)
         return self._forward_base_model(
             x_with_gfactor,

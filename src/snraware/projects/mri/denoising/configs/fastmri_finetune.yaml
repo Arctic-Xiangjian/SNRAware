@@ -111,6 +111,7 @@ fastmri_finetune:
   warmup_epochs: 5
   unet_lr: 1.0e-4
   adapter_lr: 1.0e-5
+  gradient_clip_val: 1.0
   weight_decay: 0.0
   scheduler_t_max: 0
   resume_from: null
