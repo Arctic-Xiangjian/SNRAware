@@ -118,9 +118,10 @@ fastmri_finetune:
   save_root: "./checkpoints/fine_tune"
   run_name: null
   log_every_n_steps: 50
-  evaluate_every_n_epochs: 1
+  evaluate_every_n_epochs: 10
   device: "auto"
   use_bf16: true
+  use_unet: true
   gradient_checkpoint_frozen_base: true
   train_pre_post: false
   gfactor_unet:

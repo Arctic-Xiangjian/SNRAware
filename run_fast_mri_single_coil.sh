@@ -53,6 +53,8 @@ Environment variables you can change:
   NUM_WORKERS            Default: 4
   MAX_EPOCHS             Default: 4
   WARMUP_EPOCHS          Default: 2
+  EVAL_EVERY             Run validation every N epochs. Default: 10
+  USE_UNET               Use the FastMRI front g-factor U-Net. Default: true
   UNET_LR                Default: 1e-4
   ADAPTER_LR             Default: 1e-5
   WEIGHT_DECAY           Default: 0.0
@@ -75,9 +77,10 @@ Examples:
   TRAIN_PATCH_SIZE=64 ./run_fast_mri_single_coil.sh
   TRAIN_PATCH_SIZE=64x96 EVAL_PATCH_BATCH_SIZE=64 PATCH_OVERLAP=16x24 ./run_fast_mri_single_coil.sh
   TRAIN_PATCH_SIZE=null ./run_fast_mri_single_coil.sh
+  USE_UNET=false MODE=lora_only ./run_fast_mri_single_coil.sh
   USE_BF16=false ./run_fast_mri_single_coil.sh
   DRY_RUN=true ./run_fast_mri_single_coil.sh
-  SAMPLE_RATE=null MAX_EPOCHS=20 WARMUP_EPOCHS=5 ./run_fast_mri_single_coil.sh
+  SAMPLE_RATE=null MAX_EPOCHS=20 WARMUP_EPOCHS=5 EVAL_EVERY=10 ./run_fast_mri_single_coil.sh
   ./run_fast_mri_single_coil.sh 1 lora.r=16 fastmri_finetune.batch_size=2
 EOF
 }
@@ -184,6 +187,13 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 MAX_EPOCHS="${MAX_EPOCHS:-4}"
 WARMUP_EPOCHS="${WARMUP_EPOCHS:-2}"
+if [[ -n "${EVAL_EVERY:-}" ]]; then
+  EVAL_EVERY="${EVAL_EVERY}"
+elif [[ -n "${EVALUATE_EVERY_N_EPOCHS:-}" ]]; then
+  EVAL_EVERY="${EVALUATE_EVERY_N_EPOCHS}"
+else
+  EVAL_EVERY="10"
+fi
 UNET_LR="${UNET_LR:-1e-4}"
 ADAPTER_LR="${ADAPTER_LR:-1e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
@@ -194,12 +204,12 @@ SAVE_ROOT="${SAVE_ROOT:-./checkpoints/fine_tune}"
 USE_WANDB="$(normalize_bool "${USE_WANDB:-false}")"
 PROJECT="${PROJECT:-fastmri-snraware}"
 USE_BF16="$(normalize_bool "${USE_BF16:-true}")"
+USE_UNET="$(normalize_bool "${USE_UNET:-true}")"
 SAMPLE_SEED="${SAMPLE_SEED:-1234}"
 DETERMINISTIC_MASK="$(normalize_bool "${DETERMINISTIC_MASK:-true}")"
 PIN_MEMORY="$(normalize_bool "${PIN_MEMORY:-true}")"
 PERSISTENT_WORKERS="$(normalize_bool "${PERSISTENT_WORKERS:-false}")"
 SHUFFLE_TRAIN="$(normalize_bool "${SHUFFLE_TRAIN:-true}")"
-EVALUATE_EVERY_N_EPOCHS="${EVALUATE_EVERY_N_EPOCHS:-1}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-20}"
 SCHEDULER_T_MAX="${SCHEDULER_T_MAX:-0}"
 DEVICE="${DEVICE:-cuda:0}"
@@ -343,7 +353,9 @@ echo "  PATCH_OVERLAP=${PATCH_OVERLAP_LABEL}"
 echo "  PATCH_INFERENCE_FOR_VAL_TEST=${PATCH_INFERENCE_STATUS}"
 echo "  MAX_EPOCHS=${MAX_EPOCHS}"
 echo "  WARMUP_EPOCHS=${WARMUP_EPOCHS}"
+echo "  EVAL_EVERY=${EVAL_EVERY}"
 echo "  USE_BF16=${USE_BF16}"
+echo "  USE_UNET=${USE_UNET}"
 echo "  TRAIN_PRE_POST=${TRAIN_PRE_POST}"
 echo "  GRADIENT_CHECKPOINT_FROZEN_BASE=${GRADIENT_CHECKPOINT_FROZEN_BASE}"
 echo "  TRAIN_SAMPLE_RATE=${SAMPLE_RATE}"
@@ -383,12 +395,13 @@ CMD=(
   "fastmri_finetune.train_volume_sample_rate=${VOLUME_SAMPLE_RATE}"
   "fastmri_finetune.sample_seed=${SAMPLE_SEED}"
   "fastmri_finetune.deterministic_mask_from_name=${DETERMINISTIC_MASK}"
-  "fastmri_finetune.evaluate_every_n_epochs=${EVALUATE_EVERY_N_EPOCHS}"
+  "fastmri_finetune.evaluate_every_n_epochs=${EVAL_EVERY}"
   "fastmri_finetune.log_every_n_steps=${LOG_EVERY_N_STEPS}"
   "fastmri_finetune.scheduler_t_max=${SCHEDULER_T_MAX}"
   "fastmri_finetune.save_root=${SAVE_ROOT}"
   "fastmri_finetune.device=${DEVICE}"
   "fastmri_finetune.use_bf16=${USE_BF16}"
+  "fastmri_finetune.use_unet=${USE_UNET}"
   "overlap_for_inference=${RESOLVED_PATCH_OVERLAP_HYDRA}"
 )
 

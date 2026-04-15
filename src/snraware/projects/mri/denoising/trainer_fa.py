@@ -159,6 +159,61 @@ def _resolve_train_pre_post(ft_cfg: Any) -> bool:
     return bool(ft_cfg.get("train_pre_post", False))
 
 
+def _resolve_use_unet(ft_cfg: Any) -> bool:
+    return bool(ft_cfg.get("use_unet", True))
+
+
+def resolve_effective_fastmri_mode(ft_cfg: Any) -> dict[str, Any]:
+    requested_mode = str(ft_cfg.mode)
+    use_unet = _resolve_use_unet(ft_cfg)
+    if use_unet:
+        return {
+            "requested_mode": requested_mode,
+            "effective_mode": requested_mode,
+            "use_unet": True,
+            "warmup_bypassed": False,
+            "warning": None,
+        }
+
+    if requested_mode == "unet_only":
+        raise ValueError(
+            "USE_UNET=false is incompatible with MODE=unet_only because no trainable path remains. "
+            "Use MODE=lora_only, MODE=unet_and_lora, or MODE=warmup_then_both instead."
+        )
+
+    if requested_mode == "warmup_then_both":
+        return {
+            "requested_mode": requested_mode,
+            "effective_mode": "lora_only",
+            "use_unet": False,
+            "warmup_bypassed": True,
+            "warning": (
+                "USE_UNET=false bypasses the FastMRI g-factor U-Net. "
+                "Requested mode 'warmup_then_both' will skip warmup and train adapters immediately."
+            ),
+        }
+
+    if requested_mode == "unet_and_lora":
+        return {
+            "requested_mode": requested_mode,
+            "effective_mode": "lora_only",
+            "use_unet": False,
+            "warmup_bypassed": False,
+            "warning": (
+                "USE_UNET=false bypasses the FastMRI g-factor U-Net. "
+                "Requested mode 'unet_and_lora' will run as 'lora_only'."
+            ),
+        }
+
+    return {
+        "requested_mode": requested_mode,
+        "effective_mode": "lora_only",
+        "use_unet": False,
+        "warmup_bypassed": False,
+        "warning": None,
+    }
+
+
 def _resolve_eval_patch_overlap(config: DictConfig, patch_size: tuple[int, int]) -> tuple[int, int]:
     overlap_values = config.get("overlap_for_inference", [0, 0, 0])
     if len(overlap_values) < 2:
@@ -211,8 +266,9 @@ def build_fastmri_optimizer(
         model.base_model,
         train_pre_post=_resolve_train_pre_post(ft_cfg),
     )
+    effective_mode = str(mode_state.get("effective_mode", ft_cfg.mode))
 
-    if any(parameter.requires_grad for parameter in gfactor_params) or ft_cfg.mode == "warmup_then_both":
+    if any(parameter.requires_grad for parameter in gfactor_params) or effective_mode == "warmup_then_both":
         param_groups.append(
             {
                 "name": "gfactor_unet",
@@ -224,7 +280,9 @@ def build_fastmri_optimizer(
 
     if adapter_params:
         adapter_lr = (
-            0.0 if ft_cfg.mode == "warmup_then_both" and not mode_state["adapters_active"] else float(ft_cfg.adapter_lr)
+            0.0
+            if effective_mode == "warmup_then_both" and not mode_state["adapters_active"]
+            else float(ft_cfg.adapter_lr)
         )
         param_groups.append(
             {
@@ -257,17 +315,20 @@ def configure_model_for_finetune_mode(
     lora_config: Any | None = None,
     adapters_active: bool | None = None,
     train_pre_post: bool = False,
+    use_unet: bool = True,
 ) -> dict[str, Any]:
     """Configure trainable parameters for the requested FastMRI fine-tune mode."""
     supported_modes = {"unet_only", "unet_and_lora", "lora_only", "warmup_then_both"}
     if mode not in supported_modes:
         raise ValueError(f"Unsupported fine-tune mode: {mode}")
+    if mode == "unet_only" and not use_unet:
+        raise ValueError("USE_UNET=false is incompatible with MODE=unet_only")
 
     requested_adapters_active = adapters_active
     adapters_active = False
     if mode == "unet_only":
         _set_module_trainable(model.base_model, False)
-        _set_module_trainable(model.gfactor_unet, True)
+        _set_module_trainable(model.gfactor_unet, bool(use_unet))
     else:
         resolved = resolve_lora_config(
             model_config=getattr(model.base_model, "config", None),
@@ -285,7 +346,7 @@ def configure_model_for_finetune_mode(
         )
 
         if mode == "unet_and_lora":
-            _set_module_trainable(model.gfactor_unet, True)
+            _set_module_trainable(model.gfactor_unet, bool(use_unet))
             _configure_fastmri_base_model_trainable_state(
                 model.base_model,
                 train_lora=True,
@@ -301,7 +362,7 @@ def configure_model_for_finetune_mode(
             )
             adapters_active = True
         else:
-            _set_module_trainable(model.gfactor_unet, True)
+            _set_module_trainable(model.gfactor_unet, bool(use_unet))
             adapters_active = (
                 bool(requested_adapters_active) if requested_adapters_active is not None else False
             )
@@ -313,9 +374,11 @@ def configure_model_for_finetune_mode(
 
     return {
         "mode": mode,
+        "effective_mode": mode,
         "adapters_active": adapters_active,
         "has_lora": has_lora_adapters(model.base_model),
         "train_pre_post": bool(train_pre_post),
+        "use_unet": bool(use_unet),
     }
 
 
@@ -492,6 +555,11 @@ class FastMRIFineTuneTrainer:
         )
         self.use_bf16 = bool(self.precision_state["use_bf16"])
         self.precision_mode = str(self.precision_state["mode"])
+        self.mode_resolution = resolve_effective_fastmri_mode(self.ft_cfg)
+        self.requested_mode = str(self.mode_resolution["requested_mode"])
+        self.effective_mode = str(self.mode_resolution["effective_mode"])
+        self.use_unet = bool(self.mode_resolution["use_unet"])
+        self.warmup_bypassed = bool(self.mode_resolution["warmup_bypassed"])
         self.gradient_checkpoint_frozen_base = bool(
             self.ft_cfg.get("gradient_checkpoint_frozen_base", True)
         )
@@ -504,6 +572,7 @@ class FastMRIFineTuneTrainer:
             else None
         )
         self.model = model.to(device=device, dtype=torch.float32)
+        self.model.use_unet = self.use_unet
         self.run_dir = Path(run_dir)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -514,10 +583,12 @@ class FastMRIFineTuneTrainer:
         self._use_tqdm = bool(getattr(sys.stderr, "isatty", lambda: False)())
         self.mode_state = configure_model_for_finetune_mode(
             self.model,
-            mode=self.ft_cfg.mode,
+            mode=self.effective_mode,
             lora_config=config.get("lora"),
             train_pre_post=_resolve_train_pre_post(self.ft_cfg),
+            use_unet=self.use_unet,
         )
+        self.mode_state.update(self.mode_resolution)
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
         self.current_epoch = 0
@@ -526,6 +597,8 @@ class FastMRIFineTuneTrainer:
         if self.ft_cfg.resume_from:
             self._load_resume_state(self.ft_cfg.resume_from)
 
+        if self.mode_resolution["warning"] is not None:
+            self._console_print(f"[FastMRI warning] {self.mode_resolution['warning']}")
         self._print_startup_summary()
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
@@ -545,7 +618,7 @@ class FastMRIFineTuneTrainer:
             elif group.get("name") == "adapter":
                 group["lr"] = (
                     0.0
-                    if self.ft_cfg.mode == "warmup_then_both" and not self.mode_state["adapters_active"]
+                    if self.effective_mode == "warmup_then_both" and not self.mode_state["adapters_active"]
                     else float(self.ft_cfg.adapter_lr)
                 )
         if self.scheduler is not None and hasattr(self.scheduler, "base_lrs"):
@@ -556,8 +629,8 @@ class FastMRIFineTuneTrainer:
                     self.scheduler.base_lrs[index] = float(group["lr"])
 
     def _resolve_resume_adapters_active(self, payload: dict[str, Any]) -> bool:
-        if self.ft_cfg.mode != "warmup_then_both":
-            return self.ft_cfg.mode != "unet_only"
+        if self.effective_mode != "warmup_then_both":
+            return self.effective_mode != "unet_only"
 
         stored = payload.get("adapters_active", None)
         if stored is not None:
@@ -570,20 +643,28 @@ class FastMRIFineTuneTrainer:
         adapters_active = self._resolve_resume_adapters_active(payload)
         self.mode_state = configure_model_for_finetune_mode(
             self.model,
-            mode=self.ft_cfg.mode,
+            mode=self.effective_mode,
             lora_config=self.config.get("lora"),
             adapters_active=adapters_active,
             train_pre_post=_resolve_train_pre_post(self.ft_cfg),
+            use_unet=self.use_unet,
         )
+        self.mode_state.update(self.mode_resolution)
         self._sync_optimizer_learning_rates()
 
     def _load_resume_state(self, checkpoint_path: str | Path) -> None:
         payload = torch.load(checkpoint_path, map_location="cpu")
         checkpoint_mode = payload.get("mode")
-        if checkpoint_mode is not None and checkpoint_mode != self.ft_cfg.mode:
+        if checkpoint_mode is not None and checkpoint_mode != self.requested_mode:
             raise ValueError(
                 "FastMRI fine-tune resume mode mismatch: "
-                f"checkpoint mode '{checkpoint_mode}' != configured mode '{self.ft_cfg.mode}'"
+                f"checkpoint mode '{checkpoint_mode}' != configured mode '{self.requested_mode}'"
+            )
+        checkpoint_use_unet = payload.get("use_unet")
+        if checkpoint_use_unet is not None and bool(checkpoint_use_unet) != self.use_unet:
+            raise ValueError(
+                "FastMRI fine-tune resume USE_UNET mismatch: "
+                f"checkpoint use_unet={bool(checkpoint_use_unet)} != configured use_unet={self.use_unet}"
             )
         load_fastmri_finetune_checkpoint(
             self.model,
@@ -599,7 +680,7 @@ class FastMRIFineTuneTrainer:
         self._reconcile_mode_state_after_resume(payload)
 
     def _maybe_activate_adapters(self, epoch: int) -> None:
-        if self.ft_cfg.mode != "warmup_then_both":
+        if self.effective_mode != "warmup_then_both":
             return
         if self.mode_state["adapters_active"]:
             return
@@ -650,8 +731,8 @@ class FastMRIFineTuneTrainer:
         return f"{float(value):.4f}"
 
     def _should_keep_base_model_in_eval_mode(self) -> bool:
-        return self.ft_cfg.mode == "unet_only" or (
-            self.ft_cfg.mode == "warmup_then_both" and not self.mode_state["adapters_active"]
+        return self.effective_mode == "unet_only" or (
+            self.effective_mode == "warmup_then_both" and not self.mode_state["adapters_active"]
         )
 
     def _apply_training_modes(self) -> None:
@@ -756,7 +837,10 @@ class FastMRIFineTuneTrainer:
         )
         self._console_print(
             "[FastMRI trainer] "
-            f"mode={self.ft_cfg.mode} | "
+            f"requested_mode={self.requested_mode} | "
+            f"effective_mode={self.effective_mode} | "
+            f"use_unet={'yes' if self.use_unet else 'no'} | "
+            f"warmup_bypassed={'yes' if self.warmup_bypassed else 'no'} | "
             f"precision={self.precision_mode} | "
             f"train_patch_size={self.train_patch_size or 'full'} | "
             f"eval_crop_size={eval_crop_size or 'unknown'} | "
@@ -772,7 +856,8 @@ class FastMRIFineTuneTrainer:
         self._console_print(
             "[Epoch "
             f"{epoch + 1}/{int(self.ft_cfg.max_epochs)}] "
-            f"mode={self.ft_cfg.mode} | "
+            f"requested_mode={self.requested_mode} | "
+            f"effective_mode={self.effective_mode} | "
             f"adapters_active={self.mode_state['adapters_active']} | "
             f"checkpoint_base_model={self._should_checkpoint_frozen_base()} | "
             f"frozen_base_eval={self._should_keep_base_model_in_eval_mode()} | "
@@ -1226,10 +1311,14 @@ class FastMRIFineTuneTrainer:
             self._print_metric_summary("train", train_metrics)
 
             val_metrics = {"loss": float("nan"), "psnr": float("nan"), "ssim": float("nan"), "nmse": float("nan")}
+            should_run_final_validation = (epoch + 1) == int(self.ft_cfg.max_epochs)
+            should_run_interval_validation = (
+                int(self.ft_cfg.evaluate_every_n_epochs) > 0
+                and (epoch + 1) % int(self.ft_cfg.evaluate_every_n_epochs) == 0
+            )
             if (
                 self.val_loader is not None
-                and int(self.ft_cfg.evaluate_every_n_epochs) > 0
-                and (epoch + 1) % int(self.ft_cfg.evaluate_every_n_epochs) == 0
+                and (should_run_interval_validation or should_run_final_validation)
             ):
                 val_metrics = self.evaluate_loader(self.val_loader, split="val")
                 results[f"val_epoch_{epoch}"] = val_metrics

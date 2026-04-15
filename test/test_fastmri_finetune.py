@@ -83,6 +83,7 @@ def _tiny_config(mode: str):
             "log_every_n_steps": 100,
             "evaluate_every_n_epochs": 1,
             "use_bf16": False,
+            "use_unet": True,
             "gradient_checkpoint_frozen_base": True,
             "train_pre_post": False,
             "train_patch_size": None,
@@ -164,10 +165,10 @@ class FlatFastMRIDataset(Dataset):
         return self.noisy[index], self.clean[index], torch.tensor(0.0), metadata
 
 
-def _build_wrapped_model(mode: str, size: int = 32) -> SNRAwareWithGFactor:
+def _build_wrapped_model(mode: str, size: int = 32, *, use_unet: bool = True) -> SNRAwareWithGFactor:
     config = _tiny_config(mode)
     base_model = DenoisingModel(config=config, D=1, H=size, W=size)
-    return SNRAwareWithGFactor(base_model=base_model)
+    return SNRAwareWithGFactor(base_model=base_model, use_unet=use_unet)
 
 
 def _write_fake_fastmri_volume(path: Path, *, size: int = 320) -> None:
@@ -276,6 +277,21 @@ def test_wrapper_bypasses_gfactor_for_native_3ch_input():
     assert gfactor.calls == 0
     assert output.shape == (2, 2, 1, 8, 8)
     assert torch.equal(base_model.last_input, noisy)
+
+
+def test_wrapper_can_short_circuit_gfactor_unet_with_ones_map():
+    base_model = DummyBaseModel()
+    gfactor = DummyGFactor()
+    model = SNRAwareWithGFactor(base_model=base_model, gfactor_unet=gfactor, use_unet=False)
+
+    noisy = torch.randn(2, 2, 8, 8)
+    output = model(noisy)
+
+    assert gfactor.calls == 0
+    assert output.shape == (2, 2, 1, 8, 8)
+    assert base_model.last_input is not None
+    assert torch.allclose(base_model.last_input[:, 2], torch.ones_like(base_model.last_input[:, 2]))
+    assert model.last_gfactor_stats == {"mean": 1.0, "p95": 1.0, "max": 1.0}
 
 
 @pytest.mark.parametrize(
@@ -487,6 +503,23 @@ def test_fastmri_checkpoint_payload_records_adapters_active(tmp_path: Path):
     assert payload["adapters_active"] is False
     assert payload["train_pre_post"] is False
     assert all(".lora_" in key for key in payload["lora_adapter"])
+
+
+def test_fastmri_checkpoint_payload_records_use_unet(tmp_path: Path):
+    model = _build_wrapped_model("lora_only", use_unet=False)
+    checkpoint_path = tmp_path / "short_circuit_state.pth"
+    save_fastmri_finetune_checkpoint(
+        model,
+        checkpoint_path,
+        mode="lora_only",
+        adapters_active=True,
+        config={"fastmri_finetune": {"train_pre_post": False, "use_unet": False}},
+        lora_config={"enabled": True, "r": 2, "lora_alpha": 8.0, "lora_dropout": 0.0},
+        epoch=0,
+    )
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    assert payload["use_unet"] is False
 
 
 def test_fastmri_checkpoint_loader_skips_duplicate_lora_injection(tmp_path: Path):
@@ -909,6 +942,8 @@ def test_fastmri_config_defaults_to_small_base_model():
     assert config.base_model.variant == "small"
     assert config.base_model.config_path is None
     assert config.base_model.checkpoint_path is None
+    assert int(config.fastmri_finetune.evaluate_every_n_epochs) == 10
+    assert bool(config.fastmri_finetune.use_unet) is True
     assert config.fastmri_finetune.train_pre_post is False
     assert list(config.fastmri_finetune.train_patch_size) == [64, 64]
     assert int(config.fastmri_finetune.eval_patch_batch_size) == 64
@@ -928,13 +963,17 @@ def test_run_fastmri_launcher_exposes_patch_training_controls():
     assert 'EVAL_PATCH_BATCH_SIZE="${EVAL_PATCH_BATCH_SIZE:-64}"' in script
     assert 'CROP_SIZE="${CROP_SIZE:-320}"' in script
     assert 'PATCH_OVERLAP="${PATCH_OVERLAP:-16}"' in script
+    assert 'USE_UNET="$(normalize_bool "${USE_UNET:-true}")"' in script
     assert 'TRAIN_PRE_POST="$(normalize_bool "${TRAIN_PRE_POST:-false}")"' in script
     assert 'GRADIENT_CHECKPOINT_FROZEN_BASE="$(normalize_bool "${GRADIENT_CHECKPOINT_FROZEN_BASE:-true}")"' in script
     assert 'DRY_RUN="$(normalize_bool "${DRY_RUN:-false}")"' in script
+    assert 'EVAL_EVERY="10"' in script
     assert '"fastmri_finetune.train_patch_size=${RESOLVED_TRAIN_PATCH_HYDRA}"' in script
     assert '"fastmri_finetune.eval_patch_batch_size=${EVAL_PATCH_BATCH_SIZE}"' in script
     assert '"fastmri_finetune.crop_size=${RESOLVED_CROP_HYDRA}"' in script
     assert '"overlap_for_inference=${RESOLVED_PATCH_OVERLAP_HYDRA}"' in script
+    assert '"fastmri_finetune.evaluate_every_n_epochs=${EVAL_EVERY}"' in script
+    assert '"fastmri_finetune.use_unet=${USE_UNET}"' in script
     assert 'CHECKPOINT_NATIVE_SPATIAL_SIZE=' in script
 
 
@@ -948,9 +987,13 @@ def test_run_fastmri_launcher_dry_run_defaults_to_native_patch_size(tmp_path: Pa
     assert "TRAIN_INPUT_SIZE=64x64" in result.stdout
     assert "EVAL_CROP_SIZE=320x320" in result.stdout
     assert "EVAL_PATCH_BATCH_SIZE=64" in result.stdout
+    assert "EVAL_EVERY=10" in result.stdout
+    assert "USE_UNET=true" in result.stdout
     assert "CHECKPOINT_NATIVE_SPATIAL_SIZE=" in result.stdout
     assert "Native pretrained spatial size is 64x64" in result.stdout
     assert r"fastmri_finetune.train_patch_size=\[64\,64\]" in result.stdout
+    assert "fastmri_finetune.evaluate_every_n_epochs=10" in result.stdout
+    assert "fastmri_finetune.use_unet=true" in result.stdout
 
 
 def _run_fastmri_launcher_dry_run(
@@ -1027,6 +1070,28 @@ def test_run_fastmri_launcher_dry_run_can_disable_patch_mode(tmp_path: Path):
     assert "TRAIN_INPUT_SIZE=320x320" in result.stdout
     assert "PATCH_INFERENCE_FOR_VAL_TEST=disabled" in result.stdout
     assert "fastmri_finetune.train_patch_size=null" in result.stdout
+
+
+def test_run_fastmri_launcher_dry_run_accepts_legacy_eval_every_env_var(tmp_path: Path):
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed")
+
+    result = _run_fastmri_launcher_dry_run(tmp_path, EVALUATE_EVERY_N_EPOCHS="7")
+
+    assert result.returncode == 0, result.stderr
+    assert "EVAL_EVERY=7" in result.stdout
+    assert "fastmri_finetune.evaluate_every_n_epochs=7" in result.stdout
+
+
+def test_run_fastmri_launcher_dry_run_exposes_use_unet_override(tmp_path: Path):
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed")
+
+    result = _run_fastmri_launcher_dry_run(tmp_path, USE_UNET="false", MODE="lora_only")
+
+    assert result.returncode == 0, result.stderr
+    assert "USE_UNET=false" in result.stdout
+    assert "fastmri_finetune.use_unet=false" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -1118,6 +1183,7 @@ def test_fastmri_train_entrypoint_builds_model_at_train_patch_size(monkeypatch, 
 
     assert build_calls["height"] == 128
     assert build_calls["width"] == 128
+    assert build_calls["use_unet"] is True
     assert trainer_kwargs["train_loader"] == "train_loader"
     assert trainer_kwargs["val_loader"] == "val_loader"
 
@@ -1393,6 +1459,73 @@ def test_resume_rejects_mode_mismatch(tmp_path: Path):
             val_loader=None,
             test_loader=None,
         )
+
+
+def test_resume_rejects_use_unet_mismatch(tmp_path: Path):
+    source_config = _tiny_config("lora_only")
+    source_config.fastmri_finetune.use_unet = False
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("lora_only", use_unet=False),
+        config=source_config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "use_unet_mismatch_save",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+    checkpoint_path = trainer._save_checkpoint(tmp_path / "use_unet_mismatch.pth", epoch=0, metrics={})
+
+    resumed_config = _tiny_config("lora_only")
+    resumed_config.fastmri_finetune.use_unet = True
+    resumed_config.fastmri_finetune.resume_from = str(checkpoint_path)
+
+    with pytest.raises(ValueError, match="resume USE_UNET mismatch"):
+        FastMRIFineTuneTrainer(
+            model=_build_wrapped_model("lora_only", use_unet=True),
+            config=resumed_config,
+            device=torch.device("cpu"),
+            run_dir=tmp_path / "use_unet_mismatch_resume",
+            train_loader=train_loader,
+            val_loader=None,
+            test_loader=None,
+        )
+
+
+def test_resume_allows_legacy_checkpoint_without_use_unet(tmp_path: Path):
+    source_config = _tiny_config("lora_only")
+    source_config.fastmri_finetune.use_unet = False
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("lora_only", use_unet=False),
+        config=source_config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "legacy_use_unet_save",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+    checkpoint_path = trainer._save_checkpoint(tmp_path / "legacy_use_unet.pth", epoch=0, metrics={})
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload.pop("use_unet", None)
+    torch.save(payload, checkpoint_path)
+
+    resumed_config = _tiny_config("lora_only")
+    resumed_config.fastmri_finetune.use_unet = False
+    resumed_config.fastmri_finetune.resume_from = str(checkpoint_path)
+    resumed_trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("lora_only", use_unet=False),
+        config=resumed_config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "legacy_use_unet_resume",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    assert resumed_trainer.use_unet is False
+    assert resumed_trainer.effective_mode == "lora_only"
 
 
 @pytest.mark.parametrize(
@@ -1760,6 +1893,96 @@ def test_fastmri_warmup_keeps_base_model_in_eval_mode_until_adapters_activate(mo
     assert all(flag is True for flag in epoch1_flags)
 
 
+def test_fastmri_use_unet_false_short_circuits_warmup_to_adapter_training(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    config = _tiny_config("warmup_then_both")
+    config.fastmri_finetune.use_unet = False
+
+    train_loader = DataLoader(ToyFastMRIDataset(2, size=32), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("warmup_then_both", size=32, use_unet=False),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "use_unet_false_warmup",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    captured = capsys.readouterr()
+    assert "USE_UNET=false bypasses the FastMRI g-factor U-Net" in captured.out
+    assert trainer.requested_mode == "warmup_then_both"
+    assert trainer.effective_mode == "lora_only"
+    assert trainer.warmup_bypassed is True
+    assert trainer.mode_state["adapters_active"] is True
+    assert _gfactor_is_trainable(trainer.model) is False
+    assert trainer._current_group_lr("gfactor_unet") is None
+    assert _adapter_group_lr(trainer) == pytest.approx(float(config.fastmri_finetune.adapter_lr))
+
+
+def test_fastmri_use_unet_false_turns_unet_and_lora_into_lora_only(tmp_path: Path):
+    config = _tiny_config("unet_and_lora")
+    config.fastmri_finetune.use_unet = False
+
+    train_loader = DataLoader(ToyFastMRIDataset(2, size=32), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_and_lora", size=32, use_unet=False),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "use_unet_false_unet_and_lora",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    assert trainer.requested_mode == "unet_and_lora"
+    assert trainer.effective_mode == "lora_only"
+    assert trainer.mode_state["adapters_active"] is True
+    assert _gfactor_is_trainable(trainer.model) is False
+
+
+def test_fastmri_use_unet_false_preserves_train_pre_post_for_adapter_phase(tmp_path: Path):
+    config = _tiny_config("warmup_then_both")
+    config.fastmri_finetune.use_unet = False
+    config.fastmri_finetune.train_pre_post = True
+
+    train_loader = DataLoader(ToyFastMRIDataset(2, size=32), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("warmup_then_both", size=32, use_unet=False),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "use_unet_false_train_pre_post",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    assert trainer.effective_mode == "lora_only"
+    assert _gfactor_is_trainable(trainer.model) is False
+    assert _pre_post_trainable_names(trainer.model)
+    assert _adapter_trainable_names(trainer.model)
+
+
+def test_fastmri_use_unet_false_rejects_unet_only(tmp_path: Path):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.use_unet = False
+
+    train_loader = DataLoader(ToyFastMRIDataset(2, size=32), batch_size=1, shuffle=False)
+
+    with pytest.raises(ValueError, match="USE_UNET=false is incompatible with MODE=unet_only"):
+        FastMRIFineTuneTrainer(
+            model=_build_wrapped_model("unet_only", size=32, use_unet=False),
+            config=config,
+            device=torch.device("cpu"),
+            run_dir=tmp_path / "use_unet_false_unet_only",
+            train_loader=train_loader,
+            val_loader=None,
+            test_loader=None,
+        )
+
+
 def test_fastmri_eval_uses_inference_mode_and_eval_flag(monkeypatch, tmp_path: Path):
     config = _tiny_config("unet_only")
     config.fastmri_finetune.train_patch_size = [32, 32]
@@ -1916,6 +2139,55 @@ def test_fastmri_trainer_prints_console_progress_summaries(tmp_path: Path, capsy
     assert "gfactor_max=" in captured.out
     assert "grad_unet=" in captured.out
     assert "skipped_nonfinite_steps=0" in captured.out
+
+
+@pytest.mark.parametrize(
+    ("evaluate_every", "max_epochs", "expected_val_epochs"),
+    [
+        (10, 4, [3]),
+        (2, 5, [1, 3, 4]),
+        (1, 3, [0, 1, 2]),
+        (0, 4, [3]),
+    ],
+)
+def test_fastmri_trainer_runs_validation_on_interval_and_final_epoch(
+    monkeypatch,
+    tmp_path: Path,
+    evaluate_every: int,
+    max_epochs: int,
+    expected_val_epochs: list[int],
+):
+    config = _tiny_config("unet_only")
+    config.fastmri_finetune.max_epochs = max_epochs
+    config.fastmri_finetune.evaluate_every_n_epochs = evaluate_every
+
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    val_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("unet_only"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / f"eval_every_{evaluate_every}_{max_epochs}",
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=None,
+    )
+
+    monkeypatch.setattr(trainer, "train_one_epoch", lambda epoch: {"loss": float(epoch)})
+    val_calls: list[tuple[int, str]] = []
+
+    def fake_evaluate_loader(loader, *, split: str):
+        val_calls.append((trainer.current_epoch, split))
+        return {"loss": 0.0, "psnr": 1.0, "ssim": 1.0, "nmse": 0.0}
+
+    monkeypatch.setattr(trainer, "evaluate_loader", fake_evaluate_loader)
+    monkeypatch.setattr(trainer, "_save_checkpoint", lambda path, *, epoch, metrics: Path(path))
+
+    results = trainer.train()
+
+    assert [epoch for epoch, split in val_calls if split == "val"] == expected_val_epochs
+    assert sorted(int(key.split("_")[-1]) for key in results if key.startswith("val_epoch_")) == expected_val_epochs
 
 
 def test_fastmri_trainer_train_uses_bf16_context_but_loss_stays_fp32(monkeypatch, tmp_path: Path):

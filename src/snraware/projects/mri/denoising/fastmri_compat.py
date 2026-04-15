@@ -223,10 +223,17 @@ class NormUnet(nn.Module):
 class SNRAwareWithGFactor(nn.Module):
     """Wrap SNRAware with a g-factor predictor for 2-channel FastMRI inputs."""
 
-    def __init__(self, base_model: DenoisingModel, gfactor_unet: nn.Module | None = None):
+    def __init__(
+        self,
+        base_model: DenoisingModel,
+        gfactor_unet: nn.Module | None = None,
+        *,
+        use_unet: bool = True,
+    ):
         super().__init__()
         self.base_model = base_model
         self.gfactor_unet = gfactor_unet or NormUnet()
+        self.use_unet = bool(use_unet)
         self.config = getattr(base_model, "config", None)
         self.last_gfactor_stats: dict[str, float] | None = None
 
@@ -247,6 +254,12 @@ class SNRAwareWithGFactor(nn.Module):
 
     def predict_gfactor(self, x: torch.Tensor) -> torch.Tensor:
         x = self._prepare_2ch_input(x)
+        if not self.use_unet:
+            return torch.ones(
+                (x.shape[0], 1, x.shape[-2], x.shape[-1]),
+                device=x.device,
+                dtype=x.dtype,
+            )
         x_2d = x.squeeze(2)
         complex_last = x_2d.permute(0, 2, 3, 1).unsqueeze(1).contiguous()
         gfactor = torch.abs(self.gfactor_unet(complex_last))
@@ -447,6 +460,19 @@ def _resolve_fastmri_train_pre_post(config: Any | None) -> bool:
     return False
 
 
+def _resolve_fastmri_use_unet(config: Any | None) -> bool:
+    if config is None:
+        return True
+    if isinstance(config, DictConfig):
+        value = OmegaConf.select(config, "fastmri_finetune.use_unet")
+        return bool(value) if value is not None else True
+    if isinstance(config, dict):
+        fastmri_config = config.get("fastmri_finetune", {})
+        if isinstance(fastmri_config, dict):
+            return bool(fastmri_config.get("use_unet", True))
+    return True
+
+
 def extract_fastmri_adapter_state(
     model: SNRAwareWithGFactor,
     *,
@@ -497,6 +523,7 @@ def save_fastmri_finetune_checkpoint(
         "checkpoint_type": FASTMRI_FINETUNE_CHECKPOINT_TYPE,
         "mode": mode,
         "adapters_active": bool(adapters_active) if adapters_active is not None else None,
+        "use_unet": _resolve_fastmri_use_unet(config),
         "epoch": epoch,
         "metrics": metrics or {},
         "config": OmegaConf.to_container(config, resolve=False) if isinstance(config, DictConfig) else config,
@@ -560,6 +587,7 @@ def build_fastmri_wrapped_model(
     depth: int = 1,
     lora_config: Any | None = None,
     gfactor_unet_kwargs: dict[str, Any] | None = None,
+    use_unet: bool = True,
 ) -> tuple[SNRAwareWithGFactor, DictConfig, dict[str, Any]]:
     """Build a FastMRI fine-tune model from a base SNRAware checkpoint."""
     config = load_model_config_with_legacy_fixes(base_config_path)
@@ -582,6 +610,7 @@ def build_fastmri_wrapped_model(
     wrapped_model = SNRAwareWithGFactor(
         base_model=base_model,
         gfactor_unet=NormUnet(**(gfactor_unet_kwargs or {})),
+        use_unet=use_unet,
     )
 
     load_info = {

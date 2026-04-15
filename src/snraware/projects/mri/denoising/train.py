@@ -142,6 +142,7 @@ def run_fastmri_finetuning(config: DictConfig):
         width=model_w,
         depth=1,
         lora_config=config.get("lora"),
+        use_unet=bool(config.fastmri_finetune.get("use_unet", True)),
         gfactor_unet_kwargs=OmegaConf.to_container(
             config.fastmri_finetune.gfactor_unet, resolve=True
         ),
