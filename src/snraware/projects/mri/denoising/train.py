@@ -54,6 +54,10 @@ def _format_spatial_size(size: object) -> str:
 
 @hydra.main(version_base=None, config_path="./configs", config_name="fastmri_finetune")
 def run_fastmri_finetuning(config: DictConfig):
+    return run_fastmri_finetuning_from_config(config)
+
+
+def run_fastmri_finetuning_from_config(config: DictConfig):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("highest")

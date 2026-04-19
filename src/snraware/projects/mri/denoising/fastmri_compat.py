@@ -233,6 +233,7 @@ class SNRAwareWithGFactor(nn.Module):
         super().__init__()
         self.base_model = base_model
         self.gfactor_unet = gfactor_unet or NormUnet()
+        self.domain_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.use_unet = bool(use_unet)
         self.config = getattr(base_model, "config", None)
         self.last_gfactor_stats: dict[str, float] | None = None
@@ -240,6 +241,9 @@ class SNRAwareWithGFactor(nn.Module):
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+    def _effective_domain_scale(self, reference: torch.Tensor) -> torch.Tensor:
+        return self.domain_scale.to(device=reference.device, dtype=reference.dtype).clamp_min(1e-4)
 
     def _prepare_2ch_input(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 4 and x.shape[1] == 2:
@@ -262,7 +266,8 @@ class SNRAwareWithGFactor(nn.Module):
             )
         x_2d = x.squeeze(2)
         complex_last = x_2d.permute(0, 2, 3, 1).unsqueeze(1).contiguous()
-        gfactor = torch.abs(self.gfactor_unet(complex_last))
+        unet_out = self.gfactor_unet(complex_last)
+        gfactor = 4.0 * torch.sigmoid(unet_out) + 1.0
         return gfactor
 
     def _record_gfactor_stats(self, gfactor: torch.Tensor) -> None:
@@ -299,12 +304,14 @@ class SNRAwareWithGFactor(nn.Module):
     ) -> torch.Tensor:
         x = self._prepare_2ch_input(x)
         gfactor = self.predict_gfactor(x).unsqueeze(2)
+        domain_scale = self._effective_domain_scale(x)
         self._record_gfactor_stats(gfactor)
-        x_with_gfactor = torch.cat([x, gfactor], dim=1)
-        return self._forward_base_model(
+        x_with_gfactor = torch.cat([x * domain_scale, gfactor], dim=1)
+        output = self._forward_base_model(
             x_with_gfactor,
             checkpoint_base_model=checkpoint_base_model,
         )
+        return output / domain_scale.to(device=output.device, dtype=output.dtype)
 
     def forward(self, x: torch.Tensor, *, checkpoint_base_model: bool = False) -> torch.Tensor:
         if x.ndim == 5 and x.shape[1] == 3:
@@ -499,6 +506,34 @@ def is_fastmri_finetune_checkpoint(payload: Any) -> bool:
     return isinstance(payload, dict) and payload.get("checkpoint_type") == FASTMRI_FINETUNE_CHECKPOINT_TYPE
 
 
+def _restore_domain_scale_from_payload(
+    model: SNRAwareWithGFactor, payload: dict[str, Any]
+) -> None:
+    serialized = payload.get("domain_scale")
+    if serialized is None:
+        return
+
+    try:
+        domain_scale = torch.as_tensor(
+            serialized,
+            dtype=model.domain_scale.dtype,
+            device=model.domain_scale.device,
+        )
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError("FastMRI fine-tune checkpoint contains an invalid domain_scale") from exc
+
+    if not torch.isfinite(domain_scale).all():
+        raise ValueError("FastMRI fine-tune checkpoint contains a non-finite domain_scale")
+    if domain_scale.numel() != model.domain_scale.numel():
+        raise ValueError(
+            "FastMRI fine-tune checkpoint contains an incompatible domain_scale shape: "
+            f"expected {tuple(model.domain_scale.shape)}, got {tuple(domain_scale.shape)}"
+        )
+
+    with torch.no_grad():
+        model.domain_scale.copy_(domain_scale.reshape(model.domain_scale.shape))
+
+
 def save_fastmri_finetune_checkpoint(
     model: SNRAwareWithGFactor,
     checkpoint_path: str | Path,
@@ -529,6 +564,7 @@ def save_fastmri_finetune_checkpoint(
         "config": OmegaConf.to_container(config, resolve=False) if isinstance(config, DictConfig) else config,
         "lora_config": asdict(resolved_lora_config),
         "train_pre_post": train_pre_post,
+        "domain_scale": model.domain_scale.detach().cpu(),
         "gfactor_unet": {key: value.detach().cpu() for key, value in model.gfactor_unet.state_dict().items()},
         "lora_adapter": extract_fastmri_adapter_state(
             model,
@@ -559,6 +595,7 @@ def load_fastmri_finetune_checkpoint(
         raise ValueError("Provided checkpoint is not a FastMRI fine-tune checkpoint")
 
     model.gfactor_unet.load_state_dict(payload["gfactor_unet"], strict=True)
+    _restore_domain_scale_from_payload(model, payload)
 
     lora_state = payload.get("lora_adapter", {})
     if not lora_state:

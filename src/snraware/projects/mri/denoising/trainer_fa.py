@@ -136,6 +136,10 @@ def _set_pre_post_trainable(base_model: nn.Module, flag: bool) -> None:
             parameter.requires_grad = flag
 
 
+def _get_fastmri_gfactor_parameters(model: SNRAwareWithGFactor) -> list[nn.Parameter]:
+    return [model.domain_scale, *list(model.gfactor_unet.parameters())]
+
+
 def _get_fastmri_adapter_parameters(base_model: nn.Module, *, train_pre_post: bool) -> list[nn.Parameter]:
     return [
         parameter
@@ -261,14 +265,16 @@ def build_fastmri_optimizer(
 ) -> torch.optim.Optimizer:
     """Build the FastMRI AdamW optimizer with trainer-matching parameter groups."""
     param_groups = []
-    gfactor_params = list(model.gfactor_unet.parameters())
+    gfactor_params = [
+        parameter for parameter in _get_fastmri_gfactor_parameters(model) if parameter.requires_grad
+    ]
     adapter_params = _get_fastmri_adapter_parameters(
         model.base_model,
         train_pre_post=_resolve_train_pre_post(ft_cfg),
     )
     effective_mode = str(mode_state.get("effective_mode", ft_cfg.mode))
 
-    if any(parameter.requires_grad for parameter in gfactor_params) or effective_mode == "warmup_then_both":
+    if gfactor_params:
         param_groups.append(
             {
                 "name": "gfactor_unet",
@@ -326,6 +332,7 @@ def configure_model_for_finetune_mode(
 
     requested_adapters_active = adapters_active
     adapters_active = False
+    model.domain_scale.requires_grad = True
     if mode == "unet_only":
         _set_module_trainable(model.base_model, False)
         _set_module_trainable(model.gfactor_unet, bool(use_unet))
@@ -672,10 +679,30 @@ class FastMRIFineTuneTrainer:
             apply_lora_fn=apply_lora_to_model,
             lora_config=self.config.get("lora"),
         )
+        optimizer_state_loaded = "optimizer_state_dict" not in payload
         if "optimizer_state_dict" in payload:
-            self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+            try:
+                self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+                optimizer_state_loaded = True
+            except ValueError as exc:
+                self._console_print(
+                    "[FastMRI warning] "
+                    f"Skipping optimizer state restore from {checkpoint_path}: {exc}"
+                )
         if self.scheduler is not None and "scheduler_state_dict" in payload:
-            self.scheduler.load_state_dict(payload["scheduler_state_dict"])
+            if not optimizer_state_loaded and "optimizer_state_dict" in payload:
+                self._console_print(
+                    "[FastMRI warning] "
+                    "Skipping scheduler state restore because optimizer state could not be restored."
+                )
+            else:
+                try:
+                    self.scheduler.load_state_dict(payload["scheduler_state_dict"])
+                except ValueError as exc:
+                    self._console_print(
+                        "[FastMRI warning] "
+                        f"Skipping scheduler state restore from {checkpoint_path}: {exc}"
+                    )
         self.current_epoch = int(payload.get("epoch", -1)) + 1
         self._reconcile_mode_state_after_resume(payload)
 

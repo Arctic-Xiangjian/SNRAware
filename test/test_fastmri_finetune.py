@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ from hydra import compose, initialize
 
 import fastmri_data.work_with_snraware as fastmri_dataset_module
 from fastmri_data.work_with_snraware import FastMRISNRAwareDataset
+import train_fastmri_single_coil as fastmri_cli_module
 from snraware.projects.mri.denoising.base_model_resolver import (
     DEFAULT_BASE_MODEL_VARIANT,
     resolve_base_model_paths,
@@ -244,6 +246,19 @@ def _gfactor_is_trainable(model: SNRAwareWithGFactor) -> bool:
     return any(parameter.requires_grad for parameter in model.gfactor_unet.parameters())
 
 
+def _domain_scale_is_trainable(model: SNRAwareWithGFactor) -> bool:
+    return bool(model.domain_scale.requires_grad)
+
+
+def _group_param_ids(trainer: FastMRIFineTuneTrainer, group_name: str) -> set[int]:
+    return {
+        id(parameter)
+        for group in trainer.optimizer.param_groups
+        if group.get("name") == group_name
+        for parameter in group["params"]
+    }
+
+
 def _adapter_group_lr(trainer: FastMRIFineTuneTrainer) -> float | None:
     for group in trainer.optimizer.param_groups:
         if group.get("name") == "adapter":
@@ -263,7 +278,48 @@ def test_wrapper_routes_2ch_input_through_gfactor_head():
     assert output.shape == (2, 2, 1, 8, 8)
     assert base_model.last_input is not None
     assert base_model.last_input.shape == (2, 3, 1, 8, 8)
-    assert torch.all(base_model.last_input[:, 2] >= 0)
+    assert torch.all(base_model.last_input[:, 2] >= 1.0)
+    assert torch.all(base_model.last_input[:, 2] <= 5.0)
+
+
+def test_wrapper_bounds_gfactor_predictions_to_physical_range():
+    class ExtremeGFactor(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out = torch.full((x.shape[0], 1, x.shape[2], x.shape[3]), -100.0, dtype=x.dtype, device=x.device)
+            out[..., 1::2, :] = 100.0
+            return out
+
+    base_model = DummyBaseModel()
+    model = SNRAwareWithGFactor(base_model=base_model, gfactor_unet=ExtremeGFactor())
+
+    noisy = torch.randn(1, 2, 8, 8)
+    model(noisy)
+
+    assert base_model.last_input is not None
+    predicted_gfactor = base_model.last_input[:, 2]
+    assert torch.all(predicted_gfactor >= 1.0)
+    assert torch.all(predicted_gfactor <= 5.0)
+
+
+def test_wrapper_domain_scale_scales_fastmri_input_and_restores_output_scale():
+    base_model = DummyBaseModel()
+    gfactor = DummyGFactor()
+    model = SNRAwareWithGFactor(base_model=base_model, gfactor_unet=gfactor)
+    with torch.no_grad():
+        model.domain_scale.fill_(3.5)
+
+    noisy = torch.randn(2, 2, 8, 8)
+    output = model(noisy)
+
+    assert base_model.last_input is not None
+    expected_scale = torch.tensor(3.5, dtype=noisy.dtype)
+    expected_gfactor = 4.0 * torch.sigmoid(torch.tensor(-1.0, dtype=noisy.dtype)) + 1.0
+    assert torch.allclose(base_model.last_input[:, :2], noisy.unsqueeze(2) * expected_scale)
+    assert torch.allclose(
+        base_model.last_input[:, 2],
+        torch.full_like(base_model.last_input[:, 2], float(expected_gfactor.item())),
+    )
+    assert torch.allclose(output, noisy.unsqueeze(2))
 
 
 def test_wrapper_bypasses_gfactor_for_native_3ch_input():
@@ -396,6 +452,7 @@ def test_configure_model_for_modes(
     )
 
     assert unet_trainable is expect_unet_trainable
+    assert _domain_scale_is_trainable(model) is True
     assert adapter_trainable is expect_adapter_trainable
     assert pre_post_trainable is expect_pre_post_trainable
     assert frozen_backbone
@@ -432,6 +489,7 @@ def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path)
     with torch.no_grad():
         first_unet_param = next(model.gfactor_unet.parameters())
         first_unet_param.add_(0.5)
+        model.domain_scale.fill_(2.5)
         first_adapter_param = next(
             parameter
             for name, parameter in model.base_model.named_parameters()
@@ -452,6 +510,7 @@ def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path)
 
     payload = torch.load(checkpoint_path, map_location="cpu")
     assert is_fastmri_finetune_checkpoint(payload)
+    assert torch.equal(payload["domain_scale"], model.domain_scale.detach().cpu())
 
     fresh_model = _build_wrapped_model("unet_and_lora")
     frozen_snapshot = {
@@ -471,11 +530,83 @@ def test_fastmri_checkpoint_round_trip_restores_gfactor_and_lora(tmp_path: Path)
     assert not missing
     for key, value in model.gfactor_unet.state_dict().items():
         assert torch.equal(value, fresh_model.gfactor_unet.state_dict()[key])
+    assert torch.equal(model.domain_scale, fresh_model.domain_scale)
     for name, parameter in fresh_model.base_model.named_parameters():
         if ".lora_" in name:
             assert torch.equal(parameter, model.base_model.state_dict()[name])
         else:
             assert torch.equal(parameter, frozen_snapshot[_clean_lora_wrapped_name(name)])
+
+
+def test_fastmri_checkpoint_loader_defaults_missing_domain_scale_to_one(tmp_path: Path):
+    torch.manual_seed(9)
+    model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        model,
+        mode="unet_and_lora",
+        lora_config=model.base_model.config.lora,
+        train_pre_post=False,
+    )
+
+    checkpoint_path = tmp_path / "legacy_domain_scale_missing.pth"
+    save_fastmri_finetune_checkpoint(
+        model,
+        checkpoint_path,
+        mode="unet_and_lora",
+        adapters_active=True,
+        config=model.base_model.config,
+        lora_config=model.base_model.config.lora,
+        epoch=0,
+    )
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload.pop("domain_scale", None)
+
+    fresh_model = _build_wrapped_model("unet_and_lora")
+    assert fresh_model.domain_scale.item() == pytest.approx(1.0)
+
+    missing, unexpected = load_fastmri_finetune_checkpoint(
+        fresh_model,
+        payload,
+        apply_lora_fn=apply_lora_to_model,
+        lora_config=fresh_model.base_model.config.lora,
+    )
+
+    assert missing == []
+    assert unexpected == []
+    assert fresh_model.domain_scale.item() == pytest.approx(1.0)
+
+
+def test_fastmri_checkpoint_loader_rejects_nonfinite_domain_scale(tmp_path: Path):
+    model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        model,
+        mode="unet_and_lora",
+        lora_config=model.base_model.config.lora,
+        train_pre_post=False,
+    )
+
+    checkpoint_path = tmp_path / "bad_domain_scale.pth"
+    save_fastmri_finetune_checkpoint(
+        model,
+        checkpoint_path,
+        mode="unet_and_lora",
+        adapters_active=True,
+        config=model.base_model.config,
+        lora_config=model.base_model.config.lora,
+        epoch=0,
+    )
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload["domain_scale"] = torch.tensor(float("nan"))
+
+    with pytest.raises(ValueError, match="non-finite domain_scale"):
+        load_fastmri_finetune_checkpoint(
+            _build_wrapped_model("unet_and_lora"),
+            payload,
+            apply_lora_fn=apply_lora_to_model,
+            lora_config=model.base_model.config.lora,
+        )
 
 
 def test_fastmri_checkpoint_payload_records_adapters_active(tmp_path: Path):
@@ -949,74 +1080,172 @@ def test_fastmri_config_defaults_to_small_base_model():
     assert int(config.fastmri_finetune.eval_patch_batch_size) == 64
 
 
-def test_run_fastmri_launcher_exposes_use_bf16():
-    script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
-
-    assert 'USE_BF16="$(normalize_bool "${USE_BF16:-true}")"' in script
-    assert '"fastmri_finetune.use_bf16=${USE_BF16}"' in script
-
-
-def test_run_fastmri_launcher_exposes_patch_training_controls():
-    script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
-
-    assert 'TRAIN_PATCH_SIZE="${TRAIN_PATCH_SIZE:-64}"' in script
-    assert 'EVAL_PATCH_BATCH_SIZE="${EVAL_PATCH_BATCH_SIZE:-64}"' in script
-    assert 'CROP_SIZE="${CROP_SIZE:-320}"' in script
-    assert 'PATCH_OVERLAP="${PATCH_OVERLAP:-16}"' in script
-    assert 'USE_UNET="$(normalize_bool "${USE_UNET:-true}")"' in script
-    assert 'TRAIN_PRE_POST="$(normalize_bool "${TRAIN_PRE_POST:-false}")"' in script
-    assert 'GRADIENT_CHECKPOINT_FROZEN_BASE="$(normalize_bool "${GRADIENT_CHECKPOINT_FROZEN_BASE:-true}")"' in script
-    assert 'DRY_RUN="$(normalize_bool "${DRY_RUN:-false}")"' in script
-    assert 'EVAL_EVERY="10"' in script
-    assert '"fastmri_finetune.train_patch_size=${RESOLVED_TRAIN_PATCH_HYDRA}"' in script
-    assert '"fastmri_finetune.eval_patch_batch_size=${EVAL_PATCH_BATCH_SIZE}"' in script
-    assert '"fastmri_finetune.crop_size=${RESOLVED_CROP_HYDRA}"' in script
-    assert '"overlap_for_inference=${RESOLVED_PATCH_OVERLAP_HYDRA}"' in script
-    assert '"fastmri_finetune.evaluate_every_n_epochs=${EVAL_EVERY}"' in script
-    assert '"fastmri_finetune.use_unet=${USE_UNET}"' in script
-    assert 'CHECKPOINT_NATIVE_SPATIAL_SIZE=' in script
-
-
-def test_run_fastmri_launcher_dry_run_defaults_to_native_patch_size(tmp_path: Path):
-    if shutil.which("uv") is None:
-        pytest.skip("uv not installed")
-
-    result = _run_fastmri_launcher_dry_run(tmp_path, use_preset_base_model=True)
-
-    assert result.returncode == 0, result.stderr
-    assert "TRAIN_INPUT_SIZE=64x64" in result.stdout
-    assert "EVAL_CROP_SIZE=320x320" in result.stdout
-    assert "EVAL_PATCH_BATCH_SIZE=64" in result.stdout
-    assert "EVAL_EVERY=10" in result.stdout
-    assert "USE_UNET=true" in result.stdout
-    assert "CHECKPOINT_NATIVE_SPATIAL_SIZE=" in result.stdout
-    assert "Native pretrained spatial size is 64x64" in result.stdout
-    assert r"fastmri_finetune.train_patch_size=\[64\,64\]" in result.stdout
-    assert "fastmri_finetune.evaluate_every_n_epochs=10" in result.stdout
-    assert "fastmri_finetune.use_unet=true" in result.stdout
-
-
-def _run_fastmri_launcher_dry_run(
-    tmp_path: Path,
-    *,
-    use_preset_base_model: bool = False,
-    **env_overrides: str,
-):
-    script_path = Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh"
+def _make_fastmri_cli_roots(tmp_path: Path) -> tuple[Path, Path, Path]:
     train_root = tmp_path / "train"
     val_root = tmp_path / "val"
     test_root = tmp_path / "test"
     train_root.mkdir()
     val_root.mkdir()
     test_root.mkdir()
+    return train_root, val_root, test_root
 
+
+def _parse_fastmri_cli_args(tmp_path: Path, *extra_args: str) -> argparse.Namespace:
+    train_root, val_root, _ = _make_fastmri_cli_roots(tmp_path)
+    return fastmri_cli_module.parse_args(
+        ["--train-root", str(train_root), "--val-root", str(val_root), *extra_args]
+    )
+
+
+def test_fastmri_cli_defaults(tmp_path: Path):
+    args = _parse_fastmri_cli_args(tmp_path)
+
+    assert args.model_size == "large"
+    assert args.mode == "warmup_then_both"
+    assert args.use_unet is True
+    assert args.train_pre_post is True
+    assert args.precision == "auto"
+    assert args.train_patch_size == (64, 64)
+    assert args.crop_size == (320, 320)
+    assert args.patch_overlap == (16, 16)
+    assert args.eval_patch_batch_size == 64
+    assert args.max_epochs == 20
+    assert args.warmup_epochs == 5
+    assert args.evaluate_every == 2
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [("64", (64, 64)), ("64x96", (64, 96)), ("64,96", (64, 96))],
+)
+def test_fastmri_cli_parses_spatial_sizes(raw_value: str, expected: tuple[int, int]):
+    assert fastmri_cli_module.parse_spatial_size(raw_value) == expected
+
+
+def test_fastmri_cli_parses_optional_null_patch_size():
+    assert fastmri_cli_module.parse_optional_spatial_size("null") is None
+    assert fastmri_cli_module.parse_optional_spatial_size("NULL") is None
+
+
+def test_fastmri_cli_rejects_partial_explicit_model_override(tmp_path: Path):
     base_model_config = tmp_path / "base_model.yaml"
-    base_model_checkpoint = tmp_path / "base_model.pts"
     base_model_config.write_text("dummy: true\n")
-    base_model_checkpoint.write_bytes(b"dummy")
+    args = _parse_fastmri_cli_args(tmp_path, "--base-model-config", str(base_model_config), "--device", "cpu")
+
+    with pytest.raises(ValueError, match="must either both be set or both be unset"):
+        fastmri_cli_module.build_config_from_args(args)
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (("--train-patch-size", "400x400", "--crop-size", "320"), "TRAIN_PATCH_SIZE must fit inside CROP_SIZE"),
+        (("--patch-overlap", "128"), "PATCH_OVERLAP must be smaller than TRAIN_PATCH_SIZE"),
+        (("--mode", "unet_only", "--no-use-unet"), "mode=unet_only cannot be combined with --no-use-unet"),
+    ],
+)
+def test_fastmri_cli_rejects_invalid_patch_or_mode(
+    tmp_path: Path,
+    extra_args: tuple[str, ...],
+    message: str,
+):
+    args = _parse_fastmri_cli_args(tmp_path, "--device", "cpu", *extra_args)
+
+    with pytest.raises(ValueError, match=message):
+        fastmri_cli_module.build_config_from_args(args)
+
+
+def test_fastmri_cli_precision_auto_resolves_cpu_to_fp32(tmp_path: Path):
+    args = _parse_fastmri_cli_args(tmp_path, "--device", "cpu")
+    config, summary = fastmri_cli_module.build_config_from_args(args)
+
+    assert summary["TRAINING_PRECISION"] == "fp32"
+    assert config.fastmri_finetune.use_bf16 is False
+    assert config.fastmri_finetune.pin_memory is False
+    assert config.fastmri_finetune.persistent_workers is True
+
+
+def test_fastmri_cli_precision_auto_prefers_bf16_when_supported(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(fastmri_cli_module, "_resolve_device", lambda device_str: torch.device("cuda:0"))
+    monkeypatch.setattr(
+        fastmri_cli_module,
+        "resolve_fastmri_precision",
+        lambda device, use_bf16: {"mode": "bf16", "use_bf16": True},
+    )
+
+    args = _parse_fastmri_cli_args(tmp_path)
+    config, summary = fastmri_cli_module.build_config_from_args(args)
+
+    assert summary["TRAINING_PRECISION"] == "bf16"
+    assert config.fastmri_finetune.use_bf16 is True
+    assert config.fastmri_finetune.pin_memory is True
+
+
+def test_fastmri_cli_overrides_apply_after_defaults(tmp_path: Path):
+    args = _parse_fastmri_cli_args(
+        tmp_path,
+        "--device",
+        "cpu",
+        "--override",
+        "fastmri_finetune.batch_size=3",
+        "--override",
+        "lora.r=16",
+    )
+    config, _ = fastmri_cli_module.build_config_from_args(args)
+
+    assert int(config.fastmri_finetune.batch_size) == 3
+    assert int(config.lora.r) == 16
+
+
+def test_fastmri_cli_dry_run_prints_summary_and_config(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    train_root, val_root, _ = _make_fastmri_cli_roots(tmp_path)
+    monkeypatch.setattr(
+        fastmri_cli_module,
+        "run_fastmri_finetuning_from_config",
+        lambda config: pytest.fail("dry-run should not launch training"),
+    )
+
+    result = fastmri_cli_module.main(
+        [
+            "--train-root",
+            str(train_root),
+            "--val-root",
+            str(val_root),
+            "--device",
+            "cpu",
+            "--dry-run",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert "MODEL_SIZE=large" in captured.out
+    assert "MODE=warmup_then_both" in captured.out
+    assert "TRAINING_PRECISION=fp32" in captured.out
+    assert "TRAIN_INPUT_SIZE=64x64" in captured.out
+    assert "EVALUATE_EVERY=2" in captured.out
+    assert "USE_UNET=true" in captured.out
+    assert "TRAIN_PRE_POST=true" in captured.out
+    assert "CHECKPOINT_NATIVE_SPATIAL_SIZE=64x64" in captured.out
+    assert "Resolved config:" in captured.out
+    assert "train_pre_post: true" in captured.out
+    assert "Dry run requested; training was not started." in captured.out
+
+
+def _run_fastmri_launcher_dry_run(
+    tmp_path: Path,
+    *script_args: str,
+    **env_overrides: str,
+):
+    script_path = Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh"
+    train_root, val_root, test_root = _make_fastmri_cli_roots(tmp_path)
 
     env = {
         **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        "UV_CACHE_DIR": str(Path(__file__).resolve().parents[1] / ".uv-cache"),
         "DRY_RUN": "true",
         "TRAIN_ROOT": str(train_root),
         "VAL_ROOT": str(val_root),
@@ -1024,19 +1253,49 @@ def _run_fastmri_launcher_dry_run(
         "DEVICE": "cpu",
         "USE_WANDB": "false",
     }
-    if not use_preset_base_model:
-        env["BASE_MODEL_CONFIG"] = str(base_model_config)
-        env["BASE_MODEL_CHECKPOINT"] = str(base_model_checkpoint)
     env.update({key: str(value) for key, value in env_overrides.items()})
 
     return subprocess.run(
-        ["bash", str(script_path)],
+        ["bash", str(script_path), *script_args],
         cwd=str(script_path.parent),
         capture_output=True,
         text=True,
         env=env,
         check=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"MODE": "bad_mode"}, "invalid choice"),
+        ({"TRAIN_PATCH_SIZE": "400x400"}, "TRAIN_PATCH_SIZE must fit inside CROP_SIZE"),
+        ({"PATCH_OVERLAP": "128"}, "PATCH_OVERLAP must be smaller than TRAIN_PATCH_SIZE"),
+    ],
+)
+def test_run_fastmri_launcher_rejects_invalid_patch_or_mode(tmp_path: Path, overrides: dict[str, str], message: str):
+    result = _run_fastmri_launcher_dry_run(tmp_path, **overrides)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_run_fastmri_launcher_dry_run_uses_new_python_cli_defaults(tmp_path: Path):
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed")
+
+    result = _run_fastmri_launcher_dry_run(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "MODEL_SIZE=large" in result.stdout
+    assert "TRAIN_INPUT_SIZE=64x64" in result.stdout
+    assert "EVAL_CROP_SIZE=320x320" in result.stdout
+    assert "EVAL_PATCH_BATCH_SIZE=64" in result.stdout
+    assert "EVALUATE_EVERY=2" in result.stdout
+    assert "USE_UNET=true" in result.stdout
+    assert "TRAIN_PRE_POST=true" in result.stdout
+    assert "CHECKPOINT_NATIVE_SPATIAL_SIZE=64x64" in result.stdout
+    assert "Primary FastMRI single-coil entrypoint: train_fastmri_single_coil.py" in result.stderr
 
 
 def test_run_fastmri_launcher_dry_run_emits_patch_overrides(tmp_path: Path):
@@ -1052,12 +1311,9 @@ def test_run_fastmri_launcher_dry_run_emits_patch_overrides(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert "TRAIN_INPUT_SIZE=128x128" in result.stdout
-    assert "EVAL_CROP_SIZE=320x320" in result.stdout
-    assert "EVAL_PATCH_BATCH_SIZE=64" in result.stdout
-    assert "PATCH_INFERENCE_FOR_VAL_TEST=enabled" in result.stdout
-    assert r"fastmri_finetune.train_patch_size=\[128\,128\]" in result.stdout
-    assert r"fastmri_finetune.crop_size=\[320\,320\]" in result.stdout
-    assert r"overlap_for_inference=\[16\,16\,0\]" in result.stdout
+    assert "PATCH_INFERENCE_FOR_VAL_TEST=true" in result.stdout
+    assert "PATCH_OVERLAP=16x16" in result.stdout
+    assert "train_patch_size:" in result.stdout
 
 
 def test_run_fastmri_launcher_dry_run_can_disable_patch_mode(tmp_path: Path):
@@ -1068,8 +1324,9 @@ def test_run_fastmri_launcher_dry_run_can_disable_patch_mode(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert "TRAIN_INPUT_SIZE=320x320" in result.stdout
-    assert "PATCH_INFERENCE_FOR_VAL_TEST=disabled" in result.stdout
-    assert "fastmri_finetune.train_patch_size=null" in result.stdout
+    assert "PATCH_INFERENCE_FOR_VAL_TEST=false" in result.stdout
+    assert "PATCH_OVERLAP=16x16 (unused without train_patch_size)" in result.stdout
+    assert "train_patch_size: null" in result.stdout
 
 
 def test_run_fastmri_launcher_dry_run_accepts_legacy_eval_every_env_var(tmp_path: Path):
@@ -1079,8 +1336,8 @@ def test_run_fastmri_launcher_dry_run_accepts_legacy_eval_every_env_var(tmp_path
     result = _run_fastmri_launcher_dry_run(tmp_path, EVALUATE_EVERY_N_EPOCHS="7")
 
     assert result.returncode == 0, result.stderr
-    assert "EVAL_EVERY=7" in result.stdout
-    assert "fastmri_finetune.evaluate_every_n_epochs=7" in result.stdout
+    assert "EVALUATE_EVERY=7" in result.stdout
+    assert "evaluate_every_n_epochs: 7" in result.stdout
 
 
 def test_run_fastmri_launcher_dry_run_exposes_use_unet_override(tmp_path: Path):
@@ -1091,22 +1348,28 @@ def test_run_fastmri_launcher_dry_run_exposes_use_unet_override(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert "USE_UNET=false" in result.stdout
-    assert "fastmri_finetune.use_unet=false" in result.stdout
+    assert "use_unet: false" in result.stdout
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"MODE": "bad_mode"}, "Unsupported MODE"),
-        ({"TRAIN_PATCH_SIZE": "400x400"}, "TRAIN_PATCH_SIZE must fit inside CROP_SIZE"),
-        ({"PATCH_OVERLAP": "128"}, "PATCH_OVERLAP must be smaller than TRAIN_PATCH_SIZE"),
-    ],
-)
-def test_run_fastmri_launcher_rejects_invalid_patch_or_mode(tmp_path: Path, overrides: dict[str, str], message: str):
-    result = _run_fastmri_launcher_dry_run(tmp_path, **overrides)
+def test_run_fastmri_launcher_supports_model_size_presets(tmp_path: Path):
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed")
 
-    assert result.returncode != 0
-    assert message in result.stderr
+    result = _run_fastmri_launcher_dry_run(tmp_path, MODEL_SIZE="small")
+
+    assert result.returncode == 0, result.stderr
+    assert "MODEL_SIZE=small" in result.stdout
+    assert "snraware_small_model.yaml" in result.stdout
+
+
+def test_run_fastmri_launcher_supports_positional_cuda_device(tmp_path: Path):
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed")
+
+    result = _run_fastmri_launcher_dry_run(tmp_path, "3")
+
+    assert result.returncode == 0, result.stderr
+    assert "CUDA_VISIBLE_DEVICES=3" in result.stdout
 
 
 def test_fastmri_train_entrypoint_builds_model_at_train_patch_size(monkeypatch, tmp_path: Path):
@@ -1179,7 +1442,7 @@ def test_fastmri_train_entrypoint_builds_model_at_train_patch_size(monkeypatch, 
 
     monkeypatch.setattr(fastmri_train_module, "FastMRIFineTuneTrainer", FakeTrainer)
 
-    fastmri_train_module.run_fastmri_finetuning.__wrapped__(config)
+    fastmri_train_module.run_fastmri_finetuning_from_config(config)
 
     assert build_calls["height"] == 128
     assert build_calls["width"] == 128
@@ -1259,7 +1522,7 @@ def test_fastmri_train_entrypoint_prints_native_size_and_partial_load_warning(
 
     monkeypatch.setattr(fastmri_train_module, "FastMRIFineTuneTrainer", FakeTrainer)
 
-    fastmri_train_module.run_fastmri_finetuning.__wrapped__(config)
+    fastmri_train_module.run_fastmri_finetuning_from_config(config)
 
     captured = capsys.readouterr()
     assert "FastMRI train input: 128x128 | eval crop: 320x320 | eval sliding-window: enabled" in captured.out
@@ -1268,14 +1531,24 @@ def test_fastmri_train_entrypoint_prints_native_size_and_partial_load_warning(
     assert "Example mismatched keys: bk.B00.block.cell_0.n1.ln.weight" in captured.out
 
 
-def test_run_fastmri_launcher_supports_model_size_presets():
-    script = (Path(__file__).resolve().parents[1] / "run_fast_mri_single_coil.sh").read_text()
+def test_fastmri_hydra_entrypoint_delegates_to_shared_runner():
+    config = OmegaConf.create({"foo": "bar"})
+    expected = {"status": "ok"}
+    captured = {}
 
-    assert 'MODEL_SIZE="${MODEL_SIZE:-small}"' in script
-    assert '"base_model.variant=${MODEL_SIZE}"' in script
-    assert 'RESOLVED_BASE_MODEL_CONFIG="./checkpoints/small/snraware_small_model.yaml"' in script
-    assert 'RESOLVED_BASE_MODEL_CONFIG="./checkpoints/large/snraware_large_model.yaml"' in script
-    assert "MODEL_SIZE=large ./run_fast_mri_single_coil.sh" in script
+    def fake_runner(incoming_config):
+        captured["config"] = incoming_config
+        return expected
+
+    original_runner = fastmri_train_module.run_fastmri_finetuning_from_config
+    fastmri_train_module.run_fastmri_finetuning_from_config = fake_runner
+    try:
+        result = fastmri_train_module.run_fastmri_finetuning.__wrapped__(config)
+    finally:
+        fastmri_train_module.run_fastmri_finetuning_from_config = original_runner
+
+    assert captured["config"] is config
+    assert result == expected
 
 
 def test_e2e_pipeline_defaults_to_small_model_preset(monkeypatch):
@@ -1354,6 +1627,7 @@ def test_resume_reconciles_mode_trainable_state(
     )
 
     assert _gfactor_is_trainable(resumed_trainer.model) is expect_gfactor_trainable
+    assert _domain_scale_is_trainable(resumed_trainer.model) is True
     assert bool(_adapter_trainable_names(resumed_trainer.model)) is expect_adapter_trainable
     assert _pre_post_trainable_names(resumed_trainer.model) == []
     assert _backbone_trainable_names(resumed_trainer.model) == []
@@ -1389,6 +1663,7 @@ def test_resume_reconciles_warmup_then_both_before_activation(tmp_path: Path):
 
     assert resumed_trainer.mode_state["adapters_active"] is False
     assert _gfactor_is_trainable(resumed_trainer.model) is True
+    assert _domain_scale_is_trainable(resumed_trainer.model) is True
     assert _adapter_trainable_names(resumed_trainer.model) == []
     assert _pre_post_trainable_names(resumed_trainer.model) == []
     assert _backbone_trainable_names(resumed_trainer.model) == []
@@ -1426,6 +1701,7 @@ def test_resume_reconciles_warmup_then_both_after_activation(tmp_path: Path):
 
     assert resumed_trainer.mode_state["adapters_active"] is True
     assert _gfactor_is_trainable(resumed_trainer.model) is True
+    assert _domain_scale_is_trainable(resumed_trainer.model) is True
     assert bool(_adapter_trainable_names(resumed_trainer.model)) is True
     assert _pre_post_trainable_names(resumed_trainer.model) == []
     assert _backbone_trainable_names(resumed_trainer.model) == []
@@ -1526,6 +1802,50 @@ def test_resume_allows_legacy_checkpoint_without_use_unet(tmp_path: Path):
 
     assert resumed_trainer.use_unet is False
     assert resumed_trainer.effective_mode == "lora_only"
+    assert _domain_scale_is_trainable(resumed_trainer.model) is True
+
+
+def test_resume_skips_legacy_optimizer_state_without_domain_scale(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    config = _tiny_config("lora_only")
+    train_loader = DataLoader(ToyFastMRIDataset(2), batch_size=1, shuffle=False)
+    trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("lora_only"),
+        config=config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "legacy_optimizer_save",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+    checkpoint_path = trainer._save_checkpoint(tmp_path / "legacy_optimizer_state.pth", epoch=0, metrics={})
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload.pop("domain_scale", None)
+    payload["optimizer_state_dict"]["param_groups"][0]["params"] = payload["optimizer_state_dict"][
+        "param_groups"
+    ][0]["params"][:-1]
+    torch.save(payload, checkpoint_path)
+
+    resumed_config = _tiny_config("lora_only")
+    resumed_config.fastmri_finetune.resume_from = str(checkpoint_path)
+    resumed_trainer = FastMRIFineTuneTrainer(
+        model=_build_wrapped_model("lora_only"),
+        config=resumed_config,
+        device=torch.device("cpu"),
+        run_dir=tmp_path / "legacy_optimizer_resume",
+        train_loader=train_loader,
+        val_loader=None,
+        test_loader=None,
+    )
+
+    captured = capsys.readouterr()
+    assert "Skipping optimizer state restore" in captured.out
+    assert resumed_trainer.current_epoch == 1
+    assert resumed_trainer.model.domain_scale.item() == pytest.approx(1.0)
+    assert _domain_scale_is_trainable(resumed_trainer.model) is True
 
 
 @pytest.mark.parametrize(
@@ -1630,6 +1950,8 @@ def test_gradient_checkpointing_keeps_gfactor_gradients():
     loss.backward()
 
     assert any(parameter.grad is not None for parameter in model.gfactor_unet.parameters())
+    assert model.domain_scale.grad is not None
+    assert torch.isfinite(model.domain_scale.grad).all()
 
 
 def test_gradient_checkpointing_keeps_lora_gradients_when_adapters_active():
@@ -1647,11 +1969,33 @@ def test_gradient_checkpointing_keeps_lora_gradients_when_adapters_active():
     loss.backward()
 
     assert any(parameter.grad is not None for parameter in model.gfactor_unet.parameters())
+    assert model.domain_scale.grad is not None
+    assert torch.isfinite(model.domain_scale.grad).all()
     assert any(
         parameter.grad is not None
         for name, parameter in model.base_model.named_parameters()
         if ".lora_" in name
     )
+
+
+def test_lora_only_without_unet_keeps_domain_scale_gradients():
+    model = _build_wrapped_model("lora_only", use_unet=False)
+    configure_model_for_finetune_mode(
+        model,
+        mode="lora_only",
+        lora_config=model.base_model.config.lora,
+        train_pre_post=False,
+        use_unet=False,
+    )
+
+    noisy = torch.randn(1, 2, 32, 32, dtype=torch.float32)
+    output = model(noisy, checkpoint_base_model=True)
+    loss = complex_output_to_magnitude(output).sum()
+    loss.backward()
+
+    assert model.domain_scale.grad is not None
+    assert torch.isfinite(model.domain_scale.grad).all()
+    assert all(parameter.grad is None for parameter in model.gfactor_unet.parameters())
 
 
 def test_denoising_model_forward_backward_smoke():
@@ -1712,6 +2056,7 @@ def test_fastmri_optimizer_honors_train_pre_post_boundary(tmp_path: Path):
         if group.get("name") == "adapter"
         for parameter in group["params"]
     }
+    gfactor_param_ids = _group_param_ids(trainer, "gfactor_unet")
     pre_post_param_ids = {
         id(parameter)
         for name, parameter in trainer.model.base_model.named_parameters()
@@ -1719,6 +2064,7 @@ def test_fastmri_optimizer_honors_train_pre_post_boundary(tmp_path: Path):
     }
 
     assert adapter_param_ids
+    assert id(trainer.model.domain_scale) in gfactor_param_ids
     assert adapter_param_ids.isdisjoint(pre_post_param_ids)
 
     config.fastmri_finetune.train_pre_post = True
@@ -1738,12 +2084,14 @@ def test_fastmri_optimizer_honors_train_pre_post_boundary(tmp_path: Path):
         if group.get("name") == "adapter"
         for parameter in group["params"]
     }
+    gfactor_param_ids_with_pre_post = _group_param_ids(trainer_with_pre_post, "gfactor_unet")
     pre_post_param_ids_with_pre_post = {
         id(parameter)
         for name, parameter in trainer_with_pre_post.model.base_model.named_parameters()
         if name.startswith("pre.") or name.startswith("post.")
     }
 
+    assert id(trainer_with_pre_post.model.domain_scale) in gfactor_param_ids_with_pre_post
     assert pre_post_param_ids_with_pre_post <= adapter_param_ids_with_pre_post
 
 
@@ -1918,7 +2266,8 @@ def test_fastmri_use_unet_false_short_circuits_warmup_to_adapter_training(
     assert trainer.warmup_bypassed is True
     assert trainer.mode_state["adapters_active"] is True
     assert _gfactor_is_trainable(trainer.model) is False
-    assert trainer._current_group_lr("gfactor_unet") is None
+    assert _domain_scale_is_trainable(trainer.model) is True
+    assert trainer._current_group_lr("gfactor_unet") == pytest.approx(float(config.fastmri_finetune.unet_lr))
     assert _adapter_group_lr(trainer) == pytest.approx(float(config.fastmri_finetune.adapter_lr))
 
 
@@ -1941,6 +2290,7 @@ def test_fastmri_use_unet_false_turns_unet_and_lora_into_lora_only(tmp_path: Pat
     assert trainer.effective_mode == "lora_only"
     assert trainer.mode_state["adapters_active"] is True
     assert _gfactor_is_trainable(trainer.model) is False
+    assert _domain_scale_is_trainable(trainer.model) is True
 
 
 def test_fastmri_use_unet_false_preserves_train_pre_post_for_adapter_phase(tmp_path: Path):
@@ -1961,6 +2311,7 @@ def test_fastmri_use_unet_false_preserves_train_pre_post_for_adapter_phase(tmp_p
 
     assert trainer.effective_mode == "lora_only"
     assert _gfactor_is_trainable(trainer.model) is False
+    assert _domain_scale_is_trainable(trainer.model) is True
     assert _pre_post_trainable_names(trainer.model)
     assert _adapter_trainable_names(trainer.model)
 
