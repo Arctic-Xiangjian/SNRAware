@@ -222,16 +222,7 @@ class FastMRISNRAwareDataset(Dataset):
         under_recon_slice = _complex_center_crop(under_recon_slice, self.crop_size)
         clean_recon_slice = _complex_center_crop(clean_recon_slice, self.crop_size)
 
-        under_recon_abs = _complex_abs(under_recon_slice).squeeze(0).unsqueeze(0)
         clean_mag = _complex_abs(clean_recon_slice).squeeze(0).unsqueeze(0)
-
-        lq_running_mean = torch.tensor(0.0, dtype=torch.float32)
-        lq_running_std = under_recon_abs.mean().float()
-        if torch.equal(lq_running_std, torch.zeros_like(lq_running_std)):
-            raise ValueError(f"Encountered zero normalization scale for volume {volume_name}, slice {slice_idx}")
-
-        under_recon_slice = under_recon_slice / lq_running_std
-        clean_mag = clean_mag / lq_running_std
         under_recon_slice, clean_mag = self._maybe_random_crop_train_patch(under_recon_slice, clean_mag)
 
         noisy = rearrange(under_recon_slice.squeeze(0), "h w c -> c h w").contiguous()
@@ -244,14 +235,14 @@ class FastMRISNRAwareDataset(Dataset):
             metadata_masked_kspace = None
         else:
             metadata_mask = mask.squeeze(0).contiguous()
-            metadata_masked_kspace = (masked_kspace.squeeze(0) / lq_running_std).contiguous()
+            metadata_masked_kspace = masked_kspace.squeeze(0).contiguous()
 
         metadata = {
             "name": f"{Path(volume_name).stem}_slice_{slice_idx}",
             "volume_name": Path(volume_name).stem,
             "slice_idx": int(slice_idx),
-            "mean": lq_running_mean,
-            "std": lq_running_std,
+            "mean": torch.tensor(0.0, dtype=torch.float32),
+            "std": torch.tensor(1.0, dtype=torch.float32),
             "mask": metadata_mask,
             "masked_kspace": metadata_masked_kspace,
         }

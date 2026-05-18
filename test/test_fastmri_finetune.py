@@ -250,6 +250,14 @@ def _domain_scale_is_trainable(model: SNRAwareWithGFactor) -> bool:
     return bool(model.domain_scale.requires_grad)
 
 
+def _fastmri_current_magnitude_mean(noisy: torch.Tensor) -> torch.Tensor:
+    if noisy.ndim == 4:
+        noisy = noisy.unsqueeze(2)
+    magnitude = torch.sqrt(noisy[:, 0:1].square() + noisy[:, 1:2].square())
+    scale = magnitude.mean(dim=(-3, -2, -1), keepdim=True)
+    return torch.where(scale == 0, torch.ones_like(scale), scale)
+
+
 def _group_param_ids(trainer: FastMRIFineTuneTrainer, group_name: str) -> set[int]:
     return {
         id(parameter)
@@ -313,13 +321,34 @@ def test_wrapper_domain_scale_scales_fastmri_input_and_restores_output_scale():
 
     assert base_model.last_input is not None
     expected_scale = torch.tensor(3.5, dtype=noisy.dtype)
+    expected_current_mean = _fastmri_current_magnitude_mean(noisy)
     expected_gfactor = 4.0 * torch.sigmoid(torch.tensor(-1.0, dtype=noisy.dtype)) + 1.0
-    assert torch.allclose(base_model.last_input[:, :2], noisy.unsqueeze(2) * expected_scale)
+    assert torch.allclose(
+        base_model.last_input[:, :2],
+        noisy.unsqueeze(2) / expected_current_mean * expected_scale,
+    )
     assert torch.allclose(
         base_model.last_input[:, 2],
         torch.full_like(base_model.last_input[:, 2], float(expected_gfactor.item())),
     )
     assert torch.allclose(output, noisy.unsqueeze(2))
+
+
+@pytest.mark.parametrize("bad_scale", [0.0, -2.0])
+def test_wrapper_clamps_nonpositive_domain_scale_for_finite_forward(bad_scale: float):
+    base_model = DummyBaseModel()
+    gfactor = DummyGFactor()
+    model = SNRAwareWithGFactor(base_model=base_model, gfactor_unet=gfactor)
+    with torch.no_grad():
+        model.domain_scale.fill_(bad_scale)
+
+    noisy = torch.randn(2, 2, 8, 8)
+    output = model(noisy)
+
+    assert torch.isfinite(output).all()
+    assert torch.allclose(output, noisy.unsqueeze(2), atol=1e-5)
+    assert base_model.last_input is not None
+    assert torch.isfinite(base_model.last_input).all()
 
 
 def test_wrapper_bypasses_gfactor_for_native_3ch_input():
@@ -609,6 +638,42 @@ def test_fastmri_checkpoint_loader_rejects_nonfinite_domain_scale(tmp_path: Path
         )
 
 
+@pytest.mark.parametrize("bad_scale", [0.0, -1.0])
+def test_fastmri_checkpoint_loader_rejects_nonpositive_domain_scale(
+    bad_scale: float,
+    tmp_path: Path,
+):
+    model = _build_wrapped_model("unet_and_lora")
+    configure_model_for_finetune_mode(
+        model,
+        mode="unet_and_lora",
+        lora_config=model.base_model.config.lora,
+        train_pre_post=False,
+    )
+
+    checkpoint_path = tmp_path / "bad_nonpositive_domain_scale.pth"
+    save_fastmri_finetune_checkpoint(
+        model,
+        checkpoint_path,
+        mode="unet_and_lora",
+        adapters_active=True,
+        config=model.base_model.config,
+        lora_config=model.base_model.config.lora,
+        epoch=0,
+    )
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    payload["domain_scale"] = torch.tensor(bad_scale)
+
+    with pytest.raises(ValueError, match="non-positive domain_scale"):
+        load_fastmri_finetune_checkpoint(
+            _build_wrapped_model("unet_and_lora"),
+            payload,
+            apply_lora_fn=apply_lora_to_model,
+            lora_config=model.base_model.config.lora,
+        )
+
+
 def test_fastmri_checkpoint_payload_records_adapters_active(tmp_path: Path):
     model = _build_wrapped_model("warmup_then_both")
     configure_model_for_finetune_mode(
@@ -778,9 +843,8 @@ def test_fastmri_bridge_dataset_returns_expected_shapes_and_uses_full_resolution
     assert metadata["mask"] is None
     assert metadata["masked_kspace"] is None
 
-    noisy_mag = torch.sqrt(noisy[0:1].square() + noisy[1:2].square())
-    assert torch.allclose(noisy_mag.mean(), torch.tensor(1.0), atol=1e-4)
     assert metadata["mean"].item() == 0.0
+    assert metadata["std"].item() == 1.0
 
     with h5py.File(volume_path, "r") as hf:
         raw_kspace = np.asarray(hf["kspace"][0])
@@ -805,12 +869,8 @@ def test_fastmri_bridge_dataset_returns_expected_shapes_and_uses_full_resolution
     clean_recon_slice = fastmri_dataset_module._complex_center_crop(clean_recon_slice, (320, 320))
     under_recon_slice = fastmri_dataset_module._complex_center_crop(under_recon_slice, (320, 320))
 
-    under_recon_abs = fastmri_dataset_module._complex_abs(under_recon_slice).squeeze(0).unsqueeze(0)
-    expected_std = under_recon_abs.mean().float()
-    expected_noisy = (under_recon_slice / expected_std).squeeze(0).permute(2, 0, 1).contiguous()
-    expected_clean = (
-        fastmri_dataset_module._complex_abs(clean_recon_slice).squeeze(0).unsqueeze(0) / expected_std
-    ).contiguous()
+    expected_noisy = under_recon_slice.squeeze(0).permute(2, 0, 1).contiguous()
+    expected_clean = fastmri_dataset_module._complex_abs(clean_recon_slice).squeeze(0).unsqueeze(0).contiguous()
 
     assert torch.allclose(noisy, expected_noisy, atol=1e-5)
     assert torch.allclose(clean, expected_clean, atol=1e-5)
@@ -845,7 +905,7 @@ def test_fastmri_bridge_dataset_keeps_mask_metadata_when_no_crop(tmp_path: Path)
     assert torch.all(metadata["mask"][:, center_from:center_to, :] == 1)
 
 
-def test_fastmri_bridge_dataset_applies_train_patch_crop_after_normalization(monkeypatch, tmp_path: Path):
+def test_fastmri_bridge_dataset_applies_train_patch_crop_on_raw_values(monkeypatch, tmp_path: Path):
     data_dir = tmp_path / "singlecoil_train_patch"
     data_dir.mkdir()
     _write_fake_fastmri_volume(data_dir / "case001.h5", size=320)

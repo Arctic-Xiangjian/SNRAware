@@ -26,6 +26,7 @@ TARGET_REPLACEMENTS = {
 }
 
 FASTMRI_FINETUNE_CHECKPOINT_TYPE = "snraware_fastmri_finetune_v1"
+MIN_DOMAIN_SCALE = 1.0e-4
 
 __all__ = [
     "FASTMRI_FINETUNE_CHECKPOINT_TYPE",
@@ -243,7 +244,20 @@ class SNRAwareWithGFactor(nn.Module):
         return next(self.parameters()).device
 
     def _effective_domain_scale(self, reference: torch.Tensor) -> torch.Tensor:
-        return self.domain_scale.to(device=reference.device, dtype=reference.dtype).clamp_min(1e-4)
+        return self.domain_scale.to(device=reference.device, dtype=reference.dtype).clamp_min(MIN_DOMAIN_SCALE)
+
+    @staticmethod
+    def _fastmri_current_mean_scale(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 5 or x.shape[1] != 2:
+            raise ValueError(f"Expected FastMRI 2-channel input [B, 2, T, H, W], got {tuple(x.shape)}")
+        magnitude = torch.sqrt(x[:, 0:1, ...].square() + x[:, 1:2, ...].square())
+        scale = magnitude.mean(dim=(-3, -2, -1), keepdim=True)
+        if not torch.isfinite(scale).all():
+            raise ValueError("FastMRI current-mean normalization received a non-finite mean scale")
+        zero_scale = scale == 0
+        if zero_scale.any():
+            scale = torch.where(zero_scale, torch.ones_like(scale), scale)
+        return scale
 
     def _prepare_2ch_input(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 4 and x.shape[1] == 2:
@@ -303,15 +317,18 @@ class SNRAwareWithGFactor(nn.Module):
         checkpoint_base_model: bool = False,
     ) -> torch.Tensor:
         x = self._prepare_2ch_input(x)
-        gfactor = self.predict_gfactor(x).unsqueeze(2)
+        current_mean_scale = self._fastmri_current_mean_scale(x)
+        x_normalized = x / current_mean_scale
+        gfactor = self.predict_gfactor(x_normalized).unsqueeze(2)
         domain_scale = self._effective_domain_scale(x)
         self._record_gfactor_stats(gfactor)
-        x_with_gfactor = torch.cat([x * domain_scale, gfactor], dim=1)
+        x_with_gfactor = torch.cat([x_normalized * domain_scale, gfactor], dim=1)
         output = self._forward_base_model(
             x_with_gfactor,
             checkpoint_base_model=checkpoint_base_model,
         )
-        return output / domain_scale.to(device=output.device, dtype=output.dtype)
+        output = output / domain_scale.to(device=output.device, dtype=output.dtype)
+        return output * current_mean_scale.to(device=output.device, dtype=output.dtype)
 
     def forward(self, x: torch.Tensor, *, checkpoint_base_model: bool = False) -> torch.Tensor:
         if x.ndim == 5 and x.shape[1] == 3:
@@ -524,6 +541,8 @@ def _restore_domain_scale_from_payload(
 
     if not torch.isfinite(domain_scale).all():
         raise ValueError("FastMRI fine-tune checkpoint contains a non-finite domain_scale")
+    if not (domain_scale > 0).all():
+        raise ValueError("FastMRI fine-tune checkpoint contains a non-positive domain_scale")
     if domain_scale.numel() != model.domain_scale.numel():
         raise ValueError(
             "FastMRI fine-tune checkpoint contains an incompatible domain_scale shape: "
@@ -660,3 +679,5 @@ def build_fastmri_wrapped_model(
         "model_spatial_size": [int(height), int(width)],
     }
     return wrapped_model, config, load_info
+
+

@@ -70,6 +70,32 @@ def complex_output_to_magnitude(output: torch.Tensor) -> torch.Tensor:
     return magnitude.squeeze(2)
 
 
+def fastmri_current_magnitude_mean(noisy: torch.Tensor) -> torch.Tensor:
+    """Return the per-sample FastMRI magnitude mean scale without clamping."""
+    if noisy.ndim == 4 and noisy.shape[1] == 2:
+        real = noisy[:, 0:1, ...]
+        imag = noisy[:, 1:2, ...]
+        magnitude = torch.sqrt(real.square() + imag.square())
+        reduce_dims = (-2, -1)
+    elif noisy.ndim == 5 and noisy.shape[1] == 2:
+        real = noisy[:, 0:1, ...]
+        imag = noisy[:, 1:2, ...]
+        magnitude = torch.sqrt(real.square() + imag.square())
+        reduce_dims = (-3, -2, -1)
+    else:
+        raise ValueError(f"Expected FastMRI noisy input [B, 2, H, W] or [B, 2, T, H, W], got {tuple(noisy.shape)}")
+
+    scale = magnitude.mean(dim=reduce_dims, keepdim=True)
+    if not torch.isfinite(scale).all():
+        raise ValueError("FastMRI current-mean loss normalization received a non-finite mean scale")
+    zero_scale = scale == 0
+    if zero_scale.any():
+        scale = torch.where(zero_scale, torch.ones_like(scale), scale)
+    if noisy.ndim == 5:
+        scale = scale.squeeze(2)
+    return scale
+
+
 def resolve_train_patch_size(ft_cfg: Any) -> tuple[int, int] | None:
     """Normalize the optional FastMRI training patch size config."""
     value = ft_cfg.get("train_patch_size", None)
@@ -919,6 +945,18 @@ class FastMRIFineTuneTrainer:
     def _autocast_context(self, *, enabled: bool):
         return fastmri_autocast_context(self.device, enabled=enabled)
 
+    def _loss_on_current_mean_scale(
+        self,
+        magnitude_prediction: torch.Tensor,
+        magnitude_target: torch.Tensor,
+        noisy: torch.Tensor,
+    ) -> torch.Tensor:
+        scale = fastmri_current_magnitude_mean(noisy).to(
+            device=magnitude_prediction.device,
+            dtype=magnitude_prediction.dtype,
+        )
+        return self.loss_fn(magnitude_prediction / scale, magnitude_target / scale)
+
     def _metadata_to_cpu_numpy(
         self,
         magnitude_prediction: torch.Tensor,
@@ -1009,7 +1047,9 @@ class FastMRIFineTuneTrainer:
                         flush_patch_buffer()
 
             flush_patch_buffer()
-            batch_predictions.append(pred_sum / weight_sum.clamp_min(1.0))
+            if not torch.all(weight_sum > 0):
+                raise RuntimeError("FastMRI patch inference produced uncovered pixels during stitching")
+            batch_predictions.append(pred_sum / weight_sum)
 
         output = torch.stack(batch_predictions, dim=0).unsqueeze(2)
         if output.shape[0] != noisy.shape[0] or output.shape[-2:] != noisy.shape[-2:]:
@@ -1086,7 +1126,7 @@ class FastMRIFineTuneTrainer:
                 )
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-            loss = self.loss_fn(magnitude_output, clean)
+            loss = self._loss_on_current_mean_scale(magnitude_output, clean, noisy)
             if not self._tensor_is_finite(loss):
                 skipped_nonfinite_steps += 1
                 self._report_nonfinite_step(
@@ -1128,6 +1168,8 @@ class FastMRIFineTuneTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
             self.optimizer.step()
+            with torch.no_grad():
+                self.model.domain_scale.clamp_(min=1.0e-4)
 
             loss_sum += float(loss.item())
             step_count += 1
@@ -1269,7 +1311,7 @@ class FastMRIFineTuneTrainer:
                     output = self._forward_eval_batch(noisy)
                     magnitude_output = complex_output_to_magnitude(output)
                 magnitude_output = magnitude_output.float()
-                loss = self.loss_fn(magnitude_output, clean)
+                loss = self._loss_on_current_mean_scale(magnitude_output, clean, noisy)
 
                 loss_sum += float(loss.item())
                 batch_count += 1
