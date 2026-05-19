@@ -82,6 +82,12 @@ uv run pytest -m gpu ./test
 
 Dataset for MR denoising training is not opened at this moment. More information will be provided once training data is released.
 
+## FastMRI and future multi-coil note
+
+The current FastMRI fine-tuning bridge is single-coil only. It is configured with `fastmri_finetune.challenge: "singlecoil"`, and `FastMRISNRAwareDataset` rejects other challenges.
+
+If you later add multi-coil data, keep the coil dimension explicit through k-space loading and sensitivity or RSS handling until the dataset intentionally emits the SNRAware contract. Do not silently treat coils as extra image channels; either combine coils into the existing `real`, `imag`, `g-factor` input format, or make a deliberate model/trainer change for coil-aware inputs.
+
 ## Model
 Three models are released at https://huggingface.co/microsoft/SNRAware
 

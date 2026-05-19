@@ -181,6 +181,12 @@ Accepted shape modes:
 
 `noise_sigma` can be scalar-like per sample or per repetition; it is used for logging/validation scaling.
 
+### 7.2 Future Multi-Coil Hint
+
+The current LoRA data path assumes image-domain samples have already been reduced to the SNRAware channel contract: `noisy = real/imag/gmap` and `clean = real/imag`.
+
+For future multi-coil data, keep coil sensitivity, RSS, or other coil-combination logic in the dataset or a dedicated compatibility wrapper before LoRA training starts. Do not pass coil elements as extra channels unless the base model, LoRA target shapes, loss code, and inference loader are updated together.
+
 ---
 
 ## 8. Custom Dataset Class Template
@@ -285,3 +291,4 @@ It runs baseline vs LoRA passes on dummy 3D and 2D data and reports:
 1. Add explicit CLI arg/config key in `run.py` for `pretrained_model_path` and load it before LoRA injection.
 2. Add a small merge utility to export a fully merged model from base + LoRA adapter when needed for deployment.
 3. Add a unit test that validates custom dataset output signatures (`tuple` length, dtype, shape, channel order).
+4. Add a multi-coil FastMRI bridge only after the coil-combination or coil-aware model contract is explicit.

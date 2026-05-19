@@ -3,6 +3,8 @@
 
 > ⚠️ **CRITICAL DIRECTIVE (Core Isolation):**
 > The `fastmri_data` folder and the `previous_train_just_For_agnet_reference` script provided in the project are for **historical background and architectural reference only**. This code originates from earlier, distinct projects and is **completely incompatible** with the current SNRAware training pipeline. Do not attempt any code-level fusion or adaptation. When generating code or providing suggestions, **never** attempt to replace the current Dataloader with these legacy FastMRI dataset classes.
+>
+> **Future multi-coil hint:** the current FastMRI compatibility path is single-coil only. If multi-coil data is introduced later, preserve coil axes and sensitivity/RSS decisions explicitly until a dedicated bridge emits either the existing SNRAware `real/imag/gmap` contract or a deliberately updated coil-aware model contract.
 
 ---
 
@@ -40,6 +42,7 @@ Extracted concepts from legacy files to help Agents understand past research pre
 * **Metadata Extraction:** Dynamically parses **ISMRMRD XML** headers to extract `matrixSize`, encoding limits, and calculate required K-space zero-padding.
 * **Contextual Awareness:** Uses `num_adj_slices` to extract adjacent slices, providing a 3D contextual field of view for 2D backbones.
 * **Prior Loading:** Logic for loading pre-generated **Latent Features/Priors** from external directories, typically used for structural guidance in cascaded or autoregressive networks.
+* **Multi-Coil Caution:** Historical utilities may mention `multicoil`, but the active SNRAware FastMRI bridge rejects non-`singlecoil` challenges. Treat multi-coil support as future work requiring explicit coil combination or coil-aware model changes.
 
 ---
 

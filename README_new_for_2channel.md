@@ -74,6 +74,12 @@ Why this matters:
 
 In warmup-based training, this adapter is often trained first so it can stabilize the pseudo-gfactor estimation before LoRA starts adapting the backbone behavior.
 
+### 2.1 Future Multi-Coil Hint
+
+This 2-channel path is still single-coil image-domain logic. Future multi-coil data should first define how coils become one complex image and one guidance map, for example through sensitivity-aware combination, RSS target handling, or a new coil-aware wrapper.
+
+Do not pass coil elements as additional channels to this path as-is. The current wrapper expects `real/imag` input, predicts one pseudo `g-factor`, and then calls the pretrained 3-channel SNRAware base model.
+
 ---
 
 ## 3. Role Of LoRA In This Setup
@@ -250,13 +256,14 @@ That is not required if you are willing to convert the clean target to magnitude
 
 Right now `build_fastmri_dataloaders(...)` is hard-coded to instantiate `FastMRISNRAwareDataset`.
 
-So if you want to train directly from NIfTI files without editing code elsewhere, the current codebase does **not** yet expose a Hydra-configurable custom 2-channel dataset class through the FastMRI entrypoint.
+So if you want to train directly from NIfTI files without editing code elsewhere, the current codebase does **not** yet expose a Hydra-configurable custom 2-channel dataset class through the FastMRI entrypoint. The same limitation applies to future multi-coil variants: they need an explicit dataset or wrapper entrypoint rather than overloading the existing single-coil path.
 
 Minimal future modification idea:
 
 1. replace the hard-coded dataset construction with `hydra.utils.instantiate(...)`
 2. allow a custom dataset target under `fastmri_finetune`
 3. keep the same returned sample contract
+4. add a separate multi-coil contract if coils remain explicit through the model
 
 That would let a NIfTI dataset plug in cleanly without touching the trainer core.
 
@@ -396,6 +403,8 @@ For a new 2-channel dataset with no true g-factor:
 5. keep `mean=0`, `std=scale`
 6. use `mask=None` and `masked_kspace=None` for pure image-domain NIfTI data
 
+For a future multi-coil dataset, decide the coil-combination strategy before the sample reaches this trainer. The current trainer expects one 2-channel complex image per slice, not `[coil, real/imag, H, W]`.
+
 If you want the most checkpoint-native training setup currently available in this repo:
 
 - use `train_patch_size=64`
@@ -417,4 +426,3 @@ In this 2-channel path:
   - `metadata`
 - if your data is already 2-channel NIfTI, the main missing piece is usually the dataset class
 - if your labels are still complex, either convert them to magnitude in the dataset or plan a trainer change
-
